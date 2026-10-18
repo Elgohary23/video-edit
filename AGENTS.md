@@ -20,6 +20,7 @@ Local-only, browser-based video editor: auto silence cuts, dynamic auto-zoom, an
 
 ## Verification & Git
 - Test every snippet (frontend and backend) and do not stop until it passes; a change is done only when green.
-- Push each tested snippet to the remote even if the overall task is incomplete; if pushed code later proves wrong, push the fix as a follow-up. `origin` is not yet configured — ask the user for the GitHub remote when first pushing.
+- Push each tested snippet to the remote even if the overall task is incomplete; if pushed code later proves wrong, push the fix as a follow-up.
+- `origin` = `git@github.com:Elgohary23/video-edit.git` (SSH, auth already works — no credential setup needed). Main working branch: `master`.
 - Clean commits with messages that say what and why.
 - No scripts exist yet (repo starts with only `PRD.md`); when scaffolding, wire up `dev`, `test`, `typecheck`, `lint` and record the exact commands here.
