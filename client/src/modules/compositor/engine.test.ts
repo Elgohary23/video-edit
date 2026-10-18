@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { computeCropRect, computePropRect, drawFrame, type CompositorSettings } from './engine'
+import { computeContainRect, computeCropRect, computePropRect, drawFrame, type CompositorSettings } from './engine'
 import { IDENTITY_TRANSFORM } from '../motion/engine'
 import type { Clip } from '../timeline/engine'
 
@@ -24,6 +24,26 @@ describe('computeCropRect — cover fit then centered punch-in', () => {
   it('degenerate canvas still yields a sane crop', () => {
     const crop = computeCropRect(1000, 1000, 0, 100, 1)
     expect(crop.sh).toBeCloseTo(1000, 6)
+  })
+})
+
+describe('computeContainRect — pillarbox / letterbox fit preserving full frame', () => {
+  it('portrait or taller video in widescreen canvas pillarboxes without height crop', () => {
+    // 1000x1000 in 1280x720 canvas → height matches 720, width 720, centered horizontally
+    const r = computeContainRect(1000, 1000, 1280, 720, 1)
+    expect(r.dh).toBeCloseTo(720, 6)
+    expect(r.dw).toBeCloseTo(720, 6)
+    expect(r.dx).toBeCloseTo((1280 - 720) / 2, 6)
+    expect(r.dy).toBeCloseTo(0, 6)
+    // 0 pixels cropped from video source
+    expect(r.sw).toBeCloseTo(1000, 6)
+    expect(r.sh).toBeCloseTo(1000, 6)
+  })
+  it('zoom punches in within source space while maintaining letterbox destination', () => {
+    const r = computeContainRect(1000, 1000, 1280, 720, 1.15)
+    expect(r.sw).toBeCloseTo(1000 / 1.15, 6)
+    expect(r.sh).toBeCloseTo(1000 / 1.15, 6)
+    expect(r.sx).toBeCloseTo((1000 - 1000 / 1.15) / 2, 6)
   })
 })
 
@@ -115,5 +135,15 @@ describe('drawFrame', () => {
     expect(sh).toBeCloseTo(2160 / 1.15, 4)
     expect(sx + sw / 2).toBeCloseTo(1920, 4)
     expect(sy + sh / 2).toBeCloseTo(1080, 4)
+  })
+  it('draws with fitMode contain letterboxed without crop', () => {
+    const { ctx, calls } = stubCtx()
+    const video = { el: 'v-portrait' as unknown as CanvasImageSource, width: 720, height: 1280, ready: true }
+    const settings: CompositorSettings = { clips: [clip], playheadMs: 0, blurEnabled: false, blurPx: 0, fitMode: 'contain', video, activeProps: [] }
+    drawFrame(ctx, 640, 360, settings)
+
+    // Should contain inside 640x360: height is 360, width is 360 * (720/1280) = 202.5, dx = (640 - 202.5)/2 = 218.75
+    const drawMain = calls.find((c) => c.startsWith('draw:v-portrait,0,0,720,1280,218.75,0,202.5,360'))
+    expect(drawMain).toBeDefined()
   })
 })

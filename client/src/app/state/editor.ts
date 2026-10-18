@@ -39,6 +39,9 @@ export interface ExportStatus {
   detail: string
 }
 
+export type FitMode = 'contain' | 'cover';
+export type Rotation = 0 | 90 | 180 | 270
+
 export interface EditorState {
   project: MediaInfo | null
   analysisProgress: number // 0..1
@@ -48,6 +51,8 @@ export interface EditorState {
   props: PropItem[]
   selectedPropId: string | null
   blur: BlurSettings
+  fitMode: FitMode
+  rotation: Rotation
   playing: boolean
   playheadMs: number
   exportStatus: ExportStatus
@@ -56,11 +61,15 @@ export interface EditorState {
 export type EditorAction =
   | { type: 'MEDIA_IMPORTED'; fileName: string; videoUrl: string; durationMs: number }
   | { type: 'MEDIA_FAILED' }
+  | { type: 'ROTATION_SET'; rotation: Rotation }
   | { type: 'ANALYSIS_PROGRESS'; ratio: number }
   | { type: 'ANALYSIS_DONE'; samples: Float32Array; sampleRate: number; durationMs: number }
   | { type: 'SILENCE_CONFIG_SET'; config: Partial<SilenceConfig> }
   | { type: 'CUT_APPLIED'; cutPlan: CutPlan }
+  | { type: 'RESET_CUTS' }
   | { type: 'AUTO_ZOOM' }
+  | { type: 'FIT_MODE_SET'; fitMode: FitMode }
+  | { type: 'CLIP_DELETED'; clipId: string }
   | { type: 'CLIP_SPLIT'; clipId: string; atMs: number }
   | { type: 'CLIP_TRIM'; clipId: string; leftMs: number; rightMs: number }
   | { type: 'PROP_ADDED'; id: string; name: string; src: string; aspect: number }
@@ -92,10 +101,12 @@ export const initialEditorState: EditorState = {
   props: [],
   selectedPropId: null,
   blur: { enabled: false, px: 8 },
+  fitMode: 'contain',
+  rotation: 0,
   playing: false,
   playheadMs: 0,
   exportStatus: { phase: null, detail: '' },
-}
+};
 
 /** Minimal in/out separation so motion presets always have room to play. */
 const MIN_PROP_RANGE_MS = 50
@@ -126,6 +137,8 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       // changing parameters invalidates the last plan
       return { ...state, silenceConfig: { ...state.silenceConfig, ...action.config }, cutPlan: null }
 
+    case 'CLIP_DELETED':
+      return { ...state, clips: state.clips.filter(c => c.id !== action.clipId) }
     case 'CUT_APPLIED':
       return {
         ...state,
@@ -135,8 +148,20 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         playheadMs: 0,
       }
 
+    case 'RESET_CUTS':
+      return {
+        ...state,
+        clips: [],
+        cutPlan: null,
+        playing: false,
+        playheadMs: 0,
+      }
+
     case 'AUTO_ZOOM':
       return { ...state, clips: applyAutoZoom(state.clips) }
+
+    case 'FIT_MODE_SET':
+      return { ...state, fitMode: action.fitMode }
 
     case 'CLIP_SPLIT': {
       const clips = splitClip(state.clips, action.clipId, action.atMs)

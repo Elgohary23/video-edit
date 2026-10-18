@@ -21,7 +21,7 @@ interface DragSession {
  * compositor math and exports share one fixed resolution.
  */
 export function PreviewStage() {
-  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, exportToMp4, importVideo, previewSize } = useEditor()
+  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, exportToMp4, importVideo, previewSize, setFitMode } = useEditor()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const [drag, setDrag] = useState<DragSession | null>(null)
@@ -99,7 +99,8 @@ export function PreviewStage() {
         onPointerDown={onStageClick}
         onDragOver={(e) => e.preventDefault()}
         onDrop={onStageDrop}
-        className="relative mx-auto aspect-video w-full max-w-5xl overflow-hidden rounded-xl border border-line bg-black"
+        className="relative mx-auto overflow-hidden rounded-xl border border-line bg-black"
+        style={{ width: previewSize.width, height: previewSize.height }}
       >
         <canvas
           ref={canvasRef}
@@ -115,6 +116,32 @@ export function PreviewStage() {
               <p className="font-medium text-zinc-400">No media loaded</p>
               <p className="mt-1 text-xs">Drop a video file anywhere on this stage</p>
             </div>
+          </div>
+        )}
+
+        {/* Framing mode toggle badge on top-right of preview */}
+        {state.project !== null && (
+          <div className="absolute right-3 top-3 z-10 flex items-center rounded-lg border border-zinc-700/80 bg-zinc-950/80 p-0.5 shadow-lg backdrop-blur-xs text-[11px]">
+            <button
+              type="button"
+              onClick={() => setFitMode('contain')}
+              className={`rounded px-2.5 py-1 font-medium transition-colors ${
+                state.fitMode === 'contain' ? 'bg-accent text-white shadow-xs' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+              title="Fit: Shows full video frame without cropping face or borders"
+            >
+              Fit (No Crop)
+            </button>
+            <button
+              type="button"
+              onClick={() => setFitMode('cover')}
+              className={`rounded px-2.5 py-1 font-medium transition-colors ${
+                state.fitMode === 'cover' ? 'bg-accent text-white shadow-xs' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+              title="Fill: Fills 16:9 canvas (crops top/bottom or sides)"
+            >
+              Fill 16:9
+            </button>
           </div>
         )}
 
@@ -194,6 +221,12 @@ export function PreviewStage() {
           <span className="tabular-nums">
             {formatTimecode(state.playheadMs)} <span className="text-zinc-600">/ {formatTimecode(totalMs)}</span>
           </span>
+          {state.cutPlan !== null && (
+            <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-0.5 text-[10px] font-medium text-emerald-300">
+              <span className="size-1.5 rounded-full bg-emerald-400" />
+              Silence Cut Applied
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">

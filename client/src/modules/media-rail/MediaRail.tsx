@@ -35,13 +35,19 @@ function SliderRow({ label, value, min, max, step, suffix, onChange }: {
 
 /** Left rail: media import, jump-cut controls, blur, and props. */
 export function MediaRail() {
-  const { state, importVideo, setSilenceConfig, applySilenceCut, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
+  const { state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const propInputRef = useRef<HTMLInputElement>(null)
 
   const hasMedia = state.project !== null
   const hasMixdown = state.project?.mixdown !== null && state.project?.mixdown !== undefined
   const hasClips = state.clips.length > 0
+  const isCutApplied = state.cutPlan !== null
+
+  const origSec = Math.round((state.project?.durationMs ?? 0) / 100) / 10
+  const cutSec = Math.round(state.clips.reduce((acc, c) => acc + (c.srcEndMs - c.srcStartMs), 0) / 100) / 10
+  const savedSec = Math.max(0, Math.round((origSec - cutSec) * 10) / 10)
+  const pctFaster = origSec > 0 ? Math.round((savedSec / origSec) * 100) : 0
 
   const onFileDrop = (e: DragEvent<HTMLElement>) => {
     e.preventDefault()
@@ -96,31 +102,75 @@ export function MediaRail() {
       </PanelSection>
 
       <PanelSection title="Jump cut">
-        <div className="space-y-2">
+        <div className="space-y-2.5">
           <SliderRow label="Silence under" value={state.silenceConfig.thresholdDb} min={-70} max={-15} step={1} suffix="dB" onChange={(v) => setSilenceConfig({ thresholdDb: v })} />
           <SliderRow label="Min silence" value={state.silenceConfig.minSilenceMs} min={100} max={1500} step={50} suffix="ms" onChange={(v) => setSilenceConfig({ minSilenceMs: v })} />
           <SliderRow label="Padding" value={state.silenceConfig.paddingMs} min={0} max={400} step={10} suffix="ms" onChange={(v) => setSilenceConfig({ paddingMs: v })} />
-          <button
-            type="button"
-            onClick={applySilenceCut}
-            disabled={!hasMixdown}
-            className="w-full rounded-lg border border-line px-3 py-2 text-xs font-medium text-zinc-100 transition-colors hover:bg-zinc-800/70 disabled:opacity-40"
-          >
-            Apply silence cut
-          </button>
+
+          {/* Status banner */}
+          {isCutApplied ? (
+            <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/30 p-2.5 text-xs space-y-1.5">
+              <div className="flex items-center justify-between font-semibold text-emerald-400">
+                <span className="flex items-center gap-1.5">
+                  <span className="size-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-400/50" />
+                  Silence Cut Applied
+                </span>
+                <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300 font-mono">
+                  {state.clips.length} clips
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-zinc-400 pt-1 border-t border-emerald-900/40">
+                <span>Original: <strong className="text-zinc-200">{origSec}s</strong></span>
+                <span>Trimmed: <strong className="text-emerald-300">{cutSec}s</strong></span>
+                <span className="text-emerald-400 font-medium">-{savedSec}s ({pctFaster}%)</span>
+              </div>
+              <p className="text-[10px] text-zinc-400 leading-tight">
+                {state.cutPlan?.cutRegions.length ?? 0} silent gaps eliminated. Playhead skips dead air automatically.
+              </p>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between rounded-lg border border-zinc-700 bg-zinc-800/40 px-2.5 py-1.5 text-[11px] text-zinc-400">
+              <span className="flex items-center gap-1.5">
+                <span className="size-1.5 rounded-full bg-amber-400" />
+                Silence uncut (Full video)
+              </span>
+              <span className="text-[10px] text-zinc-500">Red = silence</span>
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={applySilenceCut}
+              disabled={!hasMixdown}
+              className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold transition-colors disabled:opacity-40 ${
+                isCutApplied
+                  ? 'border border-line bg-zinc-800/80 text-zinc-200 hover:bg-zinc-700'
+                  : 'bg-accent text-white shadow-md hover:opacity-90'
+              }`}
+            >
+              {isCutApplied ? '↻ Re-apply cut' : '✂ Apply silence cut'}
+            </button>
+            {isCutApplied && (
+              <button
+                type="button"
+                onClick={resetCuts}
+                className="rounded-lg border border-line px-2.5 py-2 text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
+                title="Restore uncut original video"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+
           <button
             type="button"
             onClick={autoZoom}
             disabled={!hasClips}
             className="w-full rounded-lg border border-line px-3 py-2 text-xs font-medium text-zinc-100 transition-colors hover:bg-zinc-800/70 disabled:opacity-40"
           >
-            Auto-zoom clips
+            Auto-zoom clips (100% ↔ 115%)
           </button>
-          {state.cutPlan !== null && (
-            <p className="text-[11px] text-zinc-500">
-              {state.cutPlan.cutRegions.length} silent {state.cutPlan.cutRegions.length === 1 ? 'region' : 'regions'} cut — {state.clips.length} clips remain.
-            </p>
-          )}
         </div>
       </PanelSection>
 

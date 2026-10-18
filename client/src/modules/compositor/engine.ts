@@ -27,6 +27,8 @@ export interface CompositorSettings {
   playheadMs: number
   blurEnabled: boolean
   blurPx: number
+  fitMode?: 'contain' | 'cover'
+  rotation?: 0 | 90 | 180 | 270
   /** null → render empty black frame */
   video: VideoSource | null
   /** props visible at `playheadMs`, transforms pre-resolved */
@@ -68,6 +70,55 @@ export function computeCropRect(videoW: number, videoH: number, canvasW: number,
   return { sx: sxOffset, sy: syOffset, sw: cropW, sh: cropH }
 }
 
+export interface ContainRect {
+  sx: number
+  sy: number
+  sw: number
+  sh: number
+  dx: number
+  dy: number
+  dw: number
+  dh: number
+}
+
+/**
+ * Computes source crop and destination placement that letterboxes or
+ * pillarboxes the video within the canvas, preserving 100% of the frame.
+ */
+export function computeContainRect(
+  videoW: number,
+  videoH: number,
+  canvasW: number,
+  canvasH: number,
+  zoom = 1,
+): ContainRect {
+  const safeZoom = Math.max(0.01, zoom)
+  const safeVideoH = Math.max(1, videoH)
+  const safeCanvasH = Math.max(1, canvasH)
+  const aspectVideo = videoW / safeVideoH
+  const aspectCanvas = canvasW / safeCanvasH
+
+  let dw: number
+  let dh: number
+  if (aspectVideo > aspectCanvas) {
+    dw = canvasW
+    dh = canvasW / aspectVideo
+  } else {
+    dh = canvasH
+    dw = canvasH * aspectVideo
+  }
+
+  const dx = (canvasW - dw) / 2
+  const dy = (canvasH - dh) / 2
+
+  const sw = Math.min(videoW, videoW / safeZoom)
+  const sh = Math.min(videoH, videoH / safeZoom)
+  const sx = (videoW - sw) / 2
+  const sy = (videoH - sh) / 2
+
+  return { sx, sy, sw, sh, dx, dy, dw, dh }
+}
+
 export interface PropDestRect {
   x: number
   y: number
@@ -97,6 +148,14 @@ function shouldBlur(settings: CompositorSettings): boolean {
 export function drawFrame(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, settings: CompositorSettings): void {
   ctx.clearRect(0, 0, canvasW, canvasH)
 
+  // Apply rotation if needed
+  if (settings.rotation && settings.rotation % 360 !== 0) {
+    ctx.save()
+    ctx.translate(canvasW / 2, canvasH / 2)
+    ctx.rotate((settings.rotation * Math.PI) / 180)
+    ctx.translate(-canvasW / 2, -canvasH / 2)
+  }
+
   const videoReady = settings.video?.ready === true
   if (videoReady && settings.clips.length > 0) {
     const placed = timelineToSource(settings.clips, settings.playheadMs)
@@ -105,18 +164,41 @@ export function drawFrame(ctx: CanvasRenderingContext2D, canvasW: number, canvas
       if (wasFiltered) {
         ctx.filter = `blur(${settings.blurPx}px)`
       }
-      const crop = computeCropRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
-      ctx.drawImage(
-        settings.video!.el,
-        crop.sx,
-        crop.sy,
-        crop.sw,
-        crop.sh,
-        0,
-        0,
-        canvasW,
-        canvasH,
-      )
+
+      if (settings.fitMode === 'contain') {
+        const c = computeContainRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
+        // If letterboxed or pillarboxed, render a soft blurred backdrop to avoid harsh black borders
+        if (c.dx > 0 || c.dy > 0) {
+          ctx.filter = 'blur(20px) brightness(0.35)'
+          ctx.drawImage(settings.video!.el, 0, 0, canvasW, canvasH)
+          ctx.filter = wasFiltered ? `blur(${settings.blurPx}px)` : 'none'
+        }
+        ctx.drawImage(
+          settings.video!.el,
+          c.sx,
+          c.sy,
+          c.sw,
+          c.sh,
+          c.dx,
+          c.dy,
+          c.dw,
+          c.dh,
+        )
+      } else {
+        const crop = computeCropRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
+        ctx.drawImage(
+          settings.video!.el,
+          crop.sx,
+          crop.sy,
+          crop.sw,
+          crop.sh,
+          0,
+          0,
+          canvasW,
+          canvasH,
+        )
+      }
+
       if (wasFiltered) {
         ctx.filter = 'none'
       }

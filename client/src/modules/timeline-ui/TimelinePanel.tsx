@@ -56,11 +56,20 @@ export function TimelinePanel() {
       }
       if (state.cutPlan) {
         const dur = state.project?.mixdown?.durationMs ?? 1
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.3)'
         for (const region of state.cutPlan.cutRegions) {
           const x0 = (region.startMs / dur) * w
           const x1 = (region.endMs / dur) * w
-          ctx.fillRect(x0, 0, Math.max(2, x1 - x0), h)
+          const rw = Math.max(2, x1 - x0)
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.35)'
+          ctx.fillRect(x0, 0, rw, h)
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.7)'
+          ctx.fillRect(x0, 0, rw, 2)
+          ctx.fillRect(x0, h - 2, rw, 2)
+          if (rw > 32) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)'
+            ctx.font = '10px sans-serif'
+            ctx.fillText('CUT', x0 + 4, 14)
+          }
         }
       }
     } else if (state.project) {
@@ -128,12 +137,32 @@ export function TimelinePanel() {
   return (
     <section className="shrink-0 border-t border-line p-3">
       <div className="mx-auto w-full max-w-5xl space-y-2">
-        <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.14em] text-zinc-500">
-          <span>Timeline</span>
-          <span className="tabular-nums normal-case tracking-normal">
-            {state.clips.length} clip{state.clips.length === 1 ? '' : 's'} · {state.props.length} prop
-            {state.props.length === 1 ? '' : 's'}
-          </span>
+        <div className="flex items-center justify-between text-[11px] text-zinc-400">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold uppercase tracking-[0.14em] text-zinc-300">Timeline</span>
+            {state.cutPlan !== null ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
+                <span className="size-1.5 rounded-full bg-emerald-400" />
+                Silence Cut Applied ({state.clips.length} clips)
+              </span>
+            ) : hasMedia ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-800/80 px-2 py-0.5 text-[10px] text-zinc-400">
+                Full original source (uncut)
+              </span>
+            ) : null}
+          </div>
+          <div className="flex items-center gap-3 text-[10px]">
+            {state.cutPlan !== null && (
+              <span className="flex items-center gap-1 text-zinc-400">
+                <span className="inline-block size-2 rounded-xs bg-red-500/50" />
+                Red zones = Removed silence
+              </span>
+            )}
+            <span className="tabular-nums text-zinc-400">
+              {state.clips.length} clip{state.clips.length === 1 ? '' : 's'} · {state.props.length} prop
+              {state.props.length === 1 ? '' : 's'}
+            </span>
+          </div>
         </div>
 
         <div className="relative space-y-2" data-all-lanes>

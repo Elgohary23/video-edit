@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, type ReactNode } from 'react'
-import { editorReducer, initialEditorState, type EditorState, type PropItem } from './editor'
+import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react'
+import { editorReducer, initialEditorState, type EditorState, type PropItem, type FitMode } from './editor'
 import { dbEnvelope, buildCutPlan, type SilenceConfig } from '../../modules/audio-analysis/engine'
 import { mixdownToMono, type AudioBufferLike } from '../../modules/media/engine'
 import { resolveMotion } from '../../modules/motion/engine'
@@ -20,7 +20,9 @@ export interface EditorContextValue {
   importVideo: (file: File) => void
   setSilenceConfig: (config: Partial<SilenceConfig>) => void
   applySilenceCut: () => void
+  resetCuts: () => void
   autoZoom: () => void
+  setFitMode: (mode: FitMode) => void
   splitClipAt: (clipId: string, atMs: number) => void
   trimClipBy: (clipId: string, leftMs: number, rightMs: number) => void
   addProp: (file: File) => void
@@ -43,12 +45,13 @@ export interface EditorContextValue {
   registerCanvas: (canvas: HTMLCanvasElement | null) => void
   message: string
   previewSize: { width: number; height: number }
+  deleteClip: (clipId: string) => void
 }
 
 const EditorContext = createContext<EditorContextValue | null>(null)
 
-const PREVIEW_WIDTH = 1280
-const PREVIEW_HEIGHT = 720
+const PREVIEW_WIDTH = 720
+const PREVIEW_HEIGHT = 1280
 const SEEK_EPS = 0.5
 
 /** Decoded prop images, keyed by the src they were loaded from. */
@@ -69,7 +72,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   const analysisSeqRef = useRef(0)
   const exportingRef = useRef<{ resolve: () => void } | null>(null)
   const mediaGraphRef = useRef<{ ctx: AudioContext; source: MediaElementAudioSourceNode; dest: MediaStreamAudioDestinationNode } | null>(null)
-  const [message, setMessage] = useReducerString()
+  const [message, setMessage] = useReducerString();
+  const [previewSize, setPreviewSize] = useState({ width: PREVIEW_WIDTH, height: PREVIEW_HEIGHT })
 
   /* ── Import & audio decode ─────────────────────────────────────────────── */
 
@@ -98,9 +102,14 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         videoUrl: mediaUrl,
         durationMs,
       })
+      // Set preview size to the actual video dimensions
+      if (video) setPreviewSize({ width: video.videoWidth, height: video.videoHeight })
       void extractAudio(mediaUrl)
     }
     const onEnded = () => {
+      // Reset playhead and video position when playback finishes
+      dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: 0 })
+      video.currentTime = 0
       if (!exportingRef.current && stateRef.current.playing) {
         dispatch({ type: 'PLAYBACK_SET', playing: false })
       }
@@ -108,6 +117,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
     video.addEventListener('loadedmetadata', onLoadedMetadata)
     video.addEventListener('ended', onEnded)
+    // Reset playback position so the user can replay the video immediately
+    video.currentTime = 0
     return () => {
       video.removeEventListener('loadedmetadata', onLoadedMetadata)
       video.removeEventListener('ended', onEnded)
@@ -160,6 +171,15 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     if (!project?.mixdown) return
     const env = dbEnvelope(project.mixdown.samples, project.mixdown.sampleRate)
     dispatch({ type: 'CUT_APPLIED', cutPlan: buildCutPlan(env, project.mixdown.durationMs, silenceConfig) })
+  }, [])
+
+  const resetCuts = useCallback(() => {
+    dispatch({ type: 'RESET_CUTS' })
+    setMessage('Restored uncut original video.')
+  }, [setMessage])
+
+  const setFitMode = useCallback((mode: FitMode) => {
+    dispatch({ type: 'FIT_MODE_SET', fitMode: mode })
   }, [])
 
   const autoZoom = useCallback(() => dispatch({ type: 'AUTO_ZOOM' }), [])
@@ -465,13 +485,20 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     [applySnapshotToState, setMessage],
   )
 
+  const deleteClip = useCallback((clipId: string) => {
+    dispatch({ type: 'CLIP_DELETED', clipId })
+  }, [])
+
   const value = useMemo<EditorContextValue>(
     () => ({
       state,
       importVideo,
+
       setSilenceConfig,
       applySilenceCut,
+      resetCuts,
       autoZoom,
+      setFitMode,
       splitClipAt,
       trimClipBy,
       addProp,
@@ -493,9 +520,10 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       applySavedProject,
       registerCanvas,
       message,
-      previewSize: { width: PREVIEW_WIDTH, height: PREVIEW_HEIGHT },
+      previewSize,
+      deleteClip,
     }),
-    [state, importVideo, setSilenceConfig, applySilenceCut, autoZoom, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message],
+    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, previewSize, deleteClip],
   )
 
   return (
@@ -580,6 +608,7 @@ function buildCompositorSettings(s: EditorState, video: VideoSource | null, _vid
     playheadMs: playhead,
     blurEnabled: s.blur.enabled,
     blurPx: s.blur.px,
+    fitMode: s.fitMode,
     video,
     activeProps,
   }
