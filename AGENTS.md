@@ -23,4 +23,12 @@ Local-only, browser-based video editor: auto silence cuts, dynamic auto-zoom, an
 - Push each tested snippet to the remote even if the overall task is incomplete; if pushed code later proves wrong, push the fix as a follow-up.
 - `origin` = `git@github.com:Elgohary23/video-edit.git` (SSH, auth already works — no credential setup needed). Main working branch: `master`.
 - Clean commits with messages that say what and why.
-- No scripts exist yet (repo starts with only `PRD.md`); when scaffolding, wire up `dev`, `test`, `typecheck`, `lint` and record the exact commands here.
+
+## Commands (npm workspaces: `client/` Vite+React+Tailwind, `server/` Express+Mongoose)
+- Install once at repo root: `npm install` (workspaces only — never install inside `client/` or `server/` per-package without a reason).
+- Run in one workspace: append `-w client` or `-w server` (e.g. `npm run test -w client`).
+- `npm run dev` — both workspaces in parallel (Vite on :5173, API on :4000).
+- `npm run test -w client` / `-w server` — vitest per workspace; `npm test` runs both.
+- `npm run typecheck` — tsc strict, runs per workspace; run after tests before committing.
+- `npm run lint` — ESLint (typescript-eslint + react-hooks) at repo root via `eslint.config.mjs`.
+- `npm run build -w client` / `-w server` — production builds (vite / tsup).
