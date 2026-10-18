@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { computeContainRect, computeCropRect, computePropRect, drawFrame, type CompositorSettings } from './engine'
+import { computeContainRect, computeCropRect, computePropRect, drawFrame, PREVIEW_FRAME, type CompositorSettings } from './engine'
 import { IDENTITY_TRANSFORM } from '../motion/engine'
 import type { Clip } from '../timeline/engine'
 
@@ -44,6 +44,28 @@ describe('computeContainRect — pillarbox / letterbox fit preserving full frame
     expect(r.sw).toBeCloseTo(1000 / 1.15, 6)
     expect(r.sh).toBeCloseTo(1000 / 1.15, 6)
     expect(r.sx).toBeCloseTo((1000 - 1000 / 1.15) / 2, 6)
+  })
+})
+
+describe('landscape source into the fixed 9:16 PREVIEW_FRAME', () => {
+  const { width: canvasW, height: canvasH } = PREVIEW_FRAME
+
+  it('cover crops the horizontal overflow so landscape fills the portrait frame', () => {
+    const crop = computeCropRect(1920, 1080, canvasW, canvasH, 1)
+    expect(crop.sh).toBeCloseTo(1080, 6) // full height kept
+    expect(crop.sw).toBeCloseTo(1080 * (canvasW / canvasH), 6)
+    expect(crop.sx).toBeCloseTo((1920 - crop.sw) / 2, 6)
+    expect(crop.sy).toBeCloseTo(0, 6)
+  })
+
+  it('contain pillarboxes the landscape video with zero source crop', () => {
+    const r = computeContainRect(1920, 1080, canvasW, canvasH, 1)
+    expect(r.dw).toBeCloseTo(canvasW, 6)
+    expect(r.dh).toBeCloseTo(canvasW / (1920 / 1080), 6) // 405
+    expect(r.dx).toBeCloseTo(0, 6)
+    expect(r.dy).toBeCloseTo((canvasH - r.dh) / 2, 6)
+    expect(r.sw).toBeCloseTo(1920, 6) // nothing cropped from the source
+    expect(r.sh).toBeCloseTo(1080, 6)
   })
 })
 

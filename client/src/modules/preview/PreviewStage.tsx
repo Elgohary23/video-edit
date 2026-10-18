@@ -4,6 +4,7 @@ import { formatTimecode } from '../shared/utils'
 import { hitTest, type Handle, type NormalizedRect } from '../props/engine'
 import { resolveMotion } from '../motion/engine'
 import { timelineDurationMs } from '../timeline/engine'
+import { PREVIEW_FRAME } from '../compositor/engine'
 
 interface DragSession {
   propId: string
@@ -17,11 +18,12 @@ interface DragSession {
 
 /**
  * Preview stage — compositor canvas + interactive prop overlay + transport.
- * The canvas renders 1280×720 internally and scales to fit via CSS, so the
- * compositor math and exports share one fixed resolution.
+ * The canvas renders the fixed 9:16 PREVIEW_FRAME internally and scales to
+ * fit available space via CSS, so compositor math, export, and display share
+ * one resolution regardless of the source video's aspect.
  */
 export function PreviewStage() {
-  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, exportToMp4, importVideo, previewSize, setFitMode } = useEditor()
+  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, exportToMp4, importVideo, setFitMode } = useEditor()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const [drag, setDrag] = useState<DragSession | null>(null)
@@ -94,21 +96,22 @@ export function PreviewStage() {
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 p-3 sm:p-4">
-      <div
-        ref={stageRef}
-        onPointerDown={onStageClick}
-        onDragOver={(e) => e.preventDefault()}
-        onDrop={onStageDrop}
-        className="relative mx-auto overflow-hidden rounded-xl border border-line bg-black"
-        style={{ width: previewSize.width, height: previewSize.height }}
-      >
-        <canvas
-          ref={canvasRef}
-          width={previewSize.width}
-          height={previewSize.height}
-          className="absolute inset-0 size-full"
-          aria-label="Preview canvas"
-        />
+      <div className="flex min-h-0 flex-1 items-center justify-center">
+        <div
+          ref={stageRef}
+          onPointerDown={onStageClick}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={onStageDrop}
+          className="relative aspect-[9/16] max-h-full max-w-full overflow-hidden rounded-xl border border-line bg-black"
+          style={{ height: '100%' }}
+        >
+          <canvas
+            ref={canvasRef}
+            width={PREVIEW_FRAME.width}
+            height={PREVIEW_FRAME.height}
+            className="absolute inset-0 size-full"
+            aria-label="Preview canvas"
+          />
 
         {state.project === null && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center text-center text-sm text-zinc-500">
@@ -128,7 +131,7 @@ export function PreviewStage() {
               className={`rounded px-2.5 py-1 font-medium transition-colors ${
                 state.fitMode === 'contain' ? 'bg-accent text-white shadow-xs' : 'text-zinc-400 hover:text-zinc-200'
               }`}
-              title="Fit: Shows full video frame without cropping face or borders"
+              title="Fit: shows the full video inside the 9:16 frame with soft bars (no crop)"
             >
               Fit (No Crop)
             </button>
@@ -138,9 +141,9 @@ export function PreviewStage() {
               className={`rounded px-2.5 py-1 font-medium transition-colors ${
                 state.fitMode === 'cover' ? 'bg-accent text-white shadow-xs' : 'text-zinc-400 hover:text-zinc-200'
               }`}
-              title="Fill: Fills 16:9 canvas (crops top/bottom or sides)"
+              title="Fill: fills the 9:16 frame by cropping the overflow (centered)"
             >
-              Fill 16:9
+              Fill 9:16
             </button>
           </div>
         )}
@@ -195,6 +198,7 @@ export function PreviewStage() {
               </div>
             )
           })}
+        </div>
         </div>
       </div>
 

@@ -8,6 +8,13 @@ import { timelineToSource, type Clip } from '../timeline/engine'
 import type { MotionTransform } from '../motion/engine'
 import type { NormalizedRect } from '../props/engine'
 
+/**
+ * The preview/export canvas is hard-locked to 9:16 portrait no matter the
+ * source aspect. Fit (contain) letterboxes the video inside it; Fill (cover)
+ * crops the overflow. Export records this exact resolution.
+ */
+export const PREVIEW_FRAME = { width: 720, height: 1280 } as const
+
 /** The video element (or test double) we sample for the current frame. */
 export interface VideoSource {
   el: CanvasImageSource
