@@ -89,15 +89,16 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
     const onLoadedMetadata = () => {
       const pending = pendingImportRef.current
+      const mediaUrl = srcUrlRef.current
+      if (!pending || !mediaUrl) return
       const durationMs = Number.isFinite(video.duration) ? video.duration * 1000 : 0
-      if (!pending || !srcUrlRef.current) return
       dispatch({
         type: 'MEDIA_IMPORTED',
         fileName: pending.fileName,
-        videoUrl: srcUrlRef.current,
+        videoUrl: mediaUrl,
         durationMs,
       })
-      void extractAudio()
+      void extractAudio(mediaUrl)
     }
     const onEnded = () => {
       if (!exportingRef.current && stateRef.current.playing) {
@@ -114,12 +115,12 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  async function extractAudio(): Promise<void> {
+  async function extractAudio(explicitUrl?: string): Promise<void> {
     const seq = ++analysisSeqRef.current
     try {
       dispatch({ type: 'ANALYSIS_PROGRESS', ratio: 0.25 })
       const audioCtx = new AudioContext()
-      const fileUrl = stateRef.current.project?.videoUrl
+      const fileUrl = explicitUrl ?? srcUrlRef.current ?? stateRef.current.project?.videoUrl
       if (!fileUrl) throw new Error('no media url')
       const res = await fetch(fileUrl)
       const arrayBuffer = await res.arrayBuffer()
@@ -407,7 +408,15 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     }
   }, [setMessage])
 
-  const fetchProjectList = useCallback(async () => listProjects(), [])
+  const fetchProjectList = useCallback(async () => {
+    try {
+      return await listProjects()
+    } catch (err) {
+      console.error(err)
+      setMessage(`Projects API unavailable: ${err instanceof Error ? err.message : 'failed to load'}`)
+      return []
+    }
+  }, [setMessage])
 
   const applySnapshotToState = useCallback(
     async (saved: { name?: string; payload: Record<string, unknown> }): Promise<void> => {
