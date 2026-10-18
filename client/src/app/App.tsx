@@ -1,63 +1,123 @@
-import { PanelSection } from '../modules/shared/ui/PanelSection'
+import { useEffect, useState } from 'react'
+import { EditorProvider, useEditor } from './state/EditorProvider'
+import type { SavedProjectSummary } from '../modules/projects/api'
+import { MediaRail } from '../modules/media-rail/MediaRail'
+import { PreviewStage } from '../modules/preview/PreviewStage'
+import { TimelinePanel } from '../modules/timeline-ui/TimelinePanel'
 
-/**
- * App shell — dark editor layout.
- * Desktop: left tool rail (72) + preview + bottom timeline (64).
- * Mobile: single column stacked (media > preview > timeline).
- */
-export default function App() {
+/** Header actions + inline host for the load-project popover. */
+function Toolbar() {
+  const { state, saveProject, fetchProjectList, applySavedProject, exportToMp4 } = useEditor()
+  const [projects, setProjects] = useState<SavedProjectSummary[] | null>(null)
+  const hasMedia = state.project !== null
+  const busy = state.exportStatus.phase !== null
+
   return (
-    <div className="flex h-dvh flex-col overflow-hidden bg-zinc-950 text-zinc-100">
-      <header className="flex items-center justify-between border-b border-line px-4 py-2.5">
-        <div className="flex items-center gap-2 text-sm font-semibold tracking-tight">
-          <span className="rounded size-2.5 bg-accent" aria-hidden />
-          Cut
+    <header className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2.5">
+      <div className="flex items-center gap-2 text-sm font-semibold tracking-tight">
+        <span className="rounded size-2.5 bg-accent" aria-hidden />
+        Cut
+        {state.project !== null && <span className="max-w-40 truncate text-xs font-normal text-zinc-500">{state.project.fileName}</span>}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
+        {state.exportStatus.phase !== null && <span className="animate-pulse text-accent">{state.exportStatus.detail}</span>}
+        <button
+          type="button"
+          onClick={async () => setProjects(await fetchProjectList())}
+          className="rounded-lg border border-line px-3 py-1.5 transition-colors hover:bg-zinc-800/70"
+        >
+          Load project
+        </button>
+        <button
+          type="button"
+          onClick={() => void saveProject()}
+          disabled={!hasMedia}
+          className="rounded-lg border border-line px-3 py-1.5 transition-colors hover:bg-zinc-800/70 disabled:opacity-40"
+        >
+          Save project
+        </button>
+        <button
+          type="button"
+          onClick={() => void exportToMp4()}
+          disabled={!hasMedia || busy}
+          className="rounded-lg bg-accent px-3 py-1.5 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Export MP4
+        </button>
+      </div>
+
+      {projects !== null && (
+        <div className="absolute inset-x-0 top-full z-10 mx-auto mt-1 w-full max-w-md rounded-xl border border-line bg-zinc-900 p-3 shadow-xl">
+          <div className="flex items-center justify-between text-xs text-zinc-400">
+            <span>Saved projects</span>
+            <button type="button" className="text-zinc-500 hover:text-zinc-200" onClick={() => setProjects(null)}>
+              close ×
+            </button>
+          </div>
+          {projects.length === 0 ? (
+            <p className="py-4 text-center text-xs text-zinc-600">Nothing saved yet</p>
+          ) : (
+            <ul className="mt-2 max-h-64 space-y-1 overflow-y-auto">
+              {projects.map((p) => (
+                <li key={p.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void applySavedProject(p.id)
+                      setProjects(null)
+                    }}
+                    className="flex w-full items-center justify-between rounded-lg border border-line px-3 py-2 text-left text-xs text-zinc-200 transition-colors hover:bg-zinc-800/60"
+                  >
+                    <span className="truncate">{p.name}</span>
+                    <span className="shrink-0 pl-3 tabular-nums text-zinc-500">{new Date(p.updatedAt).toLocaleString()}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
-        <div className="flex items-center gap-2 text-xs font-medium">
-          <button
-            type="button"
-            className="rounded-lg border border-line px-3 py-1.5 transition-colors hover:bg-zinc-800/70"
-            // wired by the export module in a later phase
-          >
-            Save project
-          </button>
-          <button
-            type="button"
-            className="rounded-lg bg-accent px-3 py-1.5 transition-opacity hover:opacity-90"
-            // wired by the export module in a later phase
-          >
-            Export MP4
-          </button>
-        </div>
-      </header>
+      )}
+    </header>
+  )
+}
+
+function EditorShell() {
+  const { message } = useEditor()
+  const [toast, setToast] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (message === '') return
+    setToast(message)
+    const id = window.setTimeout(() => setToast(null), 4000)
+    return () => window.clearTimeout(id)
+  }, [message])
+
+  return (
+    <div className="relative flex h-dvh flex-col overflow-hidden bg-zinc-950 text-zinc-100">
+      <Toolbar />
 
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <aside className="w-full min-w-0 shrink-0 space-y-5 overflow-y-auto border-b border-line p-3 lg:w-72 lg:border-b-0 lg:border-r">
-          <PanelSection title="Media">
-            <div className="rounded-xl border border-dashed border-line p-4 text-center text-xs text-zinc-500">
-              Drag &amp; drop a video file here
-            </div>
-          </PanelSection>
-          <PanelSection title="Controls">
-            <div className="text-xs text-zinc-600">Silence controls appear after importing a video.</div>
-          </PanelSection>
-          <PanelSection title="Props">
-            <div className="text-xs text-zinc-600">PNG overlays appear here.</div>
-          </PanelSection>
-        </aside>
-
+        <MediaRail />
         <main className="flex min-h-0 flex-1 flex-col">
-          <section className="grid min-h-0 flex-1 place-items-center p-4">
-            <div className="aspect-video max-h-full w-full max-w-4xl overflow-hidden rounded-xl border border-line bg-black">
-              {/* preview compositor renders here */}
-            </div>
-          </section>
-          <section className="h-64 shrink-0 border-t border-line p-3 lg:h-72">
-            {/* waveform + clip track + prop track render here */}
-            <p className="text-center text-xs text-zinc-600">Timeline</p>
-          </section>
+          <PreviewStage />
+          <TimelinePanel />
         </main>
       </div>
+
+      {toast && (
+        <div className="pointer-events-none fixed bottom-4 left-1/2 z-20 -translate-x-1/2 rounded-lg border border-line bg-zinc-900 px-4 py-2 text-xs text-zinc-200 shadow-xl">
+          {toast}
+        </div>
+      )}
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <EditorProvider>
+      <EditorShell />
+    </EditorProvider>
   )
 }
