@@ -3,6 +3,7 @@ import { useEditor } from '../../app/state/EditorProvider'
 import { computePeaks } from '../audio-analysis/engine'
 import { timelineDurationMs, timelineStartOfClip } from '../timeline/engine'
 import { clamp } from '../shared/utils'
+import { ClipDeleteButton } from './ClipDeleteButton'
 
 const WAVE_HEIGHT = 72
 
@@ -192,7 +193,7 @@ export function TimelinePanel() {
               return (
                 <div
                   key={clip.id}
-                  className="absolute inset-y-0 flex cursor-pointer items-center overflow-hidden rounded-md border border-zinc-700 bg-zinc-800/80 text-[10px] text-zinc-300 transition-colors hover:border-accent/70"
+                  className="group absolute inset-y-0 flex cursor-pointer items-center overflow-hidden rounded-md border border-zinc-700 bg-zinc-800/80 text-[10px] text-zinc-300 transition-colors hover:border-accent/70"
                   style={{
                     left: `${pct(startTL)}%`,
                     width: `max(0.5%, ${pct(span)}%)`,
@@ -203,6 +204,7 @@ export function TimelinePanel() {
                   onClick={() => seek(startTL)}
                 >
                   <span className="truncate px-1.5">{clip.id}</span>
+                  <ClipDeleteButton clipId={clip.id} />
                   <div
                     role="separator"
                     aria-label="Trim clip start"

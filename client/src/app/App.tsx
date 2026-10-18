@@ -4,6 +4,7 @@ import type { SavedProjectSummary } from '../modules/projects/api'
 import { MediaRail } from '../modules/media-rail/MediaRail'
 import { PreviewStage } from '../modules/preview/PreviewStage'
 import { TimelinePanel } from '../modules/timeline-ui/TimelinePanel'
+import { ScrubberBar } from '../modules/playback/ScrubberBar'
 
 /** Header actions + inline host for the load-project popover. */
 function Toolbar() {
@@ -110,6 +111,9 @@ function EditorShell() {
           {toast}
         </div>
       )}
+
+      {/* Floating scan bar — user-draggable, parks anywhere over the editor */}
+      <ScrubberBar />
     </div>
   )
 }

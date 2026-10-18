@@ -137,8 +137,13 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       // changing parameters invalidates the last plan
       return { ...state, silenceConfig: { ...state.silenceConfig, ...action.config }, cutPlan: null }
 
-    case 'CLIP_DELETED':
-      return { ...state, clips: state.clips.filter(c => c.id !== action.clipId) }
+    case 'CLIP_DELETED': {
+      // Keep the playhead inside the shrunken timeline so the preview never
+      // hangs past the end after the deleted clip contained it.
+      const clips = state.clips.filter(c => c.id !== action.clipId)
+      if (clips.length === state.clips.length) return state
+      return { ...state, clips, playheadMs: clamp(state.playheadMs, 0, timelineDurationMs(clips)) }
+    }
     case 'CUT_APPLIED':
       return {
         ...state,

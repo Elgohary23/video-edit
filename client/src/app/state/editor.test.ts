@@ -69,6 +69,25 @@ describe('clip operations', () => {
   })
 })
 
+describe('clip deletion', () => {
+  it('removes the clip by id and clamps the playhead into the shrunken timeline', () => {
+    const atEnd = editorReducer(stateWithClip(), { type: 'PLAYHEAD_SET', playheadMs: 2800 })
+    const next = editorReducer(atEnd, { type: 'CLIP_DELETED', clipId: 'clip-2' })
+    expect(next.clips).toHaveLength(1)
+    expect(next.playheadMs).toBe(1000) // timeline shrank to 1000ms
+  })
+  it('keeps a playhead that still fits the remaining timeline', () => {
+    const parked = editorReducer(stateWithClip(), { type: 'PLAYHEAD_SET', playheadMs: 800 })
+    const next = editorReducer(parked, { type: 'CLIP_DELETED', clipId: 'clip-1' })
+    expect(next.clips).toHaveLength(1)
+    expect(next.playheadMs).toBe(800)
+  })
+  it('unknown clip id is a no-op (same state reference)', () => {
+    const s = stateWithClip()
+    expect(editorReducer(s, { type: 'CLIP_DELETED', clipId: 'nope' })).toBe(s)
+  })
+})
+
 describe('prop lifecycle', () => {
   it('add clamps to media duration and selects it', () => {
     const added = editorReducer(stateWithClip(), {
