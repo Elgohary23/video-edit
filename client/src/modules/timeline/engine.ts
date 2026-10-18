@@ -72,6 +72,15 @@ export function sourceToTimeline(clips: Clip[], srcMs: number): number | null {
   return null
 }
 
+/** Index the clip at `clipIndex` starts on the timeline (sum of prior spans). */
+export function timelineStartOfClip(clips: Clip[], clipIndex: number): number {
+  let timeline = 0
+  for (let i = 0; i < clipIndex && i < clips.length; i++) {
+    timeline += clips[i].srcEndMs - clips[i].srcStartMs
+  }
+  return timeline
+}
+
 /** Split one clip's window at a timeline position into two immutable clips. */
 export function splitClip(clips: Clip[], clipId: string, atTimelineMs: number): Clip[] | null {
   const at = timelineToSource(clips, atTimelineMs)

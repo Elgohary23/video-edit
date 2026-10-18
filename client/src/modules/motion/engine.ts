@@ -76,7 +76,6 @@ export function resolveMotion(preset: MotionPresetName, timelineMs: number, star
   if (preset === 'none') return IDENTITY_TRANSFORM
 
   const transition = transitionMs(span)
-  const t01 = (timelineMs - startMs) / span
   const entryEnd = startMs + transition
   const exitStart = endMs - transition
 

@@ -78,11 +78,8 @@ describe('transcodeToMp4 with a stub FFmpeg', () => {
   })
 
   it('caches the FFmpeg instance across calls', async () => {
-    let loads = 0
     const stub = {
-      load: vi.fn(async () => {
-        loads += 1
-      }),
+      load: vi.fn(async () => undefined),
     } as unknown as import('@ffmpeg/ffmpeg').FFmpeg
     const first = await loadFfmpeg(async () => ({ coreURL: 'c', wasmURL: 'w' }), 'https://base', () => stub)
     const second = await loadFfmpeg(
