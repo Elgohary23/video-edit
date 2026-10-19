@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appendClip,
   clipsFromKeepSegments,
+  makeClipId,
   sourceToTimeline,
   splitClip,
   timelineDurationMs,
+  timelineStartOfClip,
   timelineToSource,
   trimClip,
   type Clip,
@@ -89,5 +92,35 @@ describe('trimClip', () => {
   it('refuses to consume a clip entirely', () => {
     const out = trimClip(base, 'clip-1', 0, 1120)!
     expect(out).toEqual(base)
+  })
+})
+
+describe('appendClip', () => {
+  it('puts the new clip after every existing clip on the track', () => {
+    const out = appendClip(base, { startMs: 0, endMs: 4000 }, 'vid-2', 'clip-x')
+    expect(out).toHaveLength(3)
+    expect(out[2]).toEqual({ id: 'clip-x', srcStartMs: 0, srcEndMs: 4000, zoom: 1, videoId: 'vid-2' })
+    // the appended clip starts where the track previously ended
+    expect(timelineStartOfClip(out, 2)).toBe(timelineDurationMs(base))
+    expect(timelineDurationMs(out)).toBe(timelineDurationMs(base) + 4000)
+  })
+  it('different sources keep playing back-to-back via order alone', () => {
+    const two = appendClip(appendClip([], { startMs: 50, endMs: 250 }, 'vid-1', 'a'), { startMs: 0, endMs: 900 }, 'vid-2', 'b')
+    // first clip ends at timeline 200; clip b's source 0 continues the track
+    expect(timelineToSource(two, 200)).toEqual({ clip: two[1], clipIndex: 1, srcMs: 0 })
+  })
+  it('omits videoId when not given (legacy active-source clip)', () => {
+    const out = appendClip([], { startMs: 0, endMs: 100 })
+    expect(out[0]).toEqual({ id: out[0].id, srcStartMs: 0, srcEndMs: 100, zoom: 1 })
+    expect('videoId' in out[0]).toBe(false)
+  })
+  it('does not mutate the input array', () => {
+    const snapshot = structuredClone(base)
+    appendClip(base, { startMs: 0, endMs: 10 })
+    expect(base).toEqual(snapshot)
+  })
+  it('generates unique ids when asked to', () => {
+    const seen = new Set(Array.from({ length: 50 }, () => makeClipId()))
+    expect(seen.size).toBe(50)
   })
 })

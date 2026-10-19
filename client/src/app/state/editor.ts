@@ -3,7 +3,7 @@
  * The reducer is a pure transition function; most actions are covered by
  * plain unit tests (media URLs/images are opaque values to it).
  */
-import { clipsFromKeepSegments, splitClip, trimClip, timelineDurationMs, type Clip } from '../../modules/timeline/engine'
+import { appendClip, clipsFromKeepSegments, makeClipId, splitClip, trimClip, timelineDurationMs, type Clip } from '../../modules/timeline/engine'
 import { applyAutoZoom } from '../../modules/auto-zoom/engine'
 import { DEFAULT_SILENCE_CONFIG, type CutPlan, type SilenceConfig } from '../../modules/audio-analysis/engine'
 import { MOTION_PRESET_NAMES, type MotionPresetName } from '../../modules/motion/engine'
@@ -54,12 +54,24 @@ export type Rotation = 0 | 90 | 180 | 270
 
 export interface EditorState {
   project: MediaInfo | null
-  /** Every imported video; switching resets the cut state via VIDEO_SELECTED. */
+  /** Every imported video; the timeline can accumulate clips from all of them. */
   videos: VideoSource[]
   activeVideoId: string | null
   analysisProgress: number // 0..1
   silenceConfig: SilenceConfig
+  /**
+   * Silence-cut plans keyed by the source they belong to. `cutPlan` below is
+   * the derived mirror of the ACTIVE source's entry (kept in sync by the
+   * reducer) so the UI keeps reading a single field.
+   */
+  cutPlans: Record<string, CutPlan>
+  /** The active source's plan — always in sync with `cutPlans`. */
   cutPlan: CutPlan | null
+  /**
+   * The one timeline track: an ordered list of clips, laid out back-to-back.
+   * Each clip references a window of its own source, so appending clip after
+   * clip (any import) grows the track endlessly.
+   */
   clips: Clip[]
   props: PropItem[]
   selectedPropId: string | null
@@ -88,6 +100,7 @@ export type EditorAction =
   | { type: 'SILENCE_CONFIG_SET'; config: Partial<SilenceConfig> }
   | { type: 'CUT_APPLIED'; cutPlan: CutPlan }
   | { type: 'RESET_CUTS' }
+  | { type: 'CLIP_APPEND'; videoId?: string }
   | { type: 'AUTO_ZOOM' }
   | { type: 'FIT_MODE_SET'; fitMode: FitMode }
   | { type: 'CLIP_DELETED'; clipId: string }
@@ -119,6 +132,7 @@ export const initialEditorState: EditorState = {
   activeVideoId: null,
   analysisProgress: 0,
   silenceConfig: { ...DEFAULT_SILENCE_CONFIG },
+  cutPlans: {},
   cutPlan: null,
   clips: [],
   props: [],
@@ -134,7 +148,44 @@ export const initialEditorState: EditorState = {
 /** Minimal in/out separation so motion presets always have room to play. */
 const MIN_PROP_RANGE_MS = 50
 
+/** Delete one key from a record without mutating it. */
+function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...record }
+  delete next[key]
+  return next
+}
+
+/** `state.cutPlan` mirrors the active source's stored plan (or null). */
+function withActiveCutPlan(state: EditorState): EditorState {
+  const plan = state.activeVideoId !== null ? (state.cutPlans[state.activeVideoId] ?? null) : null
+  return plan === state.cutPlan ? state : { ...state, cutPlan: plan }
+}
+
+/** Which source id a clip cuts from; legacy clips (no videoId) follow the active source. */
+export function clipSourceId(state: Pick<EditorState, 'videos' | 'activeVideoId'>, clip: Clip): string | null {
+  if (clip.videoId !== undefined) {
+    return state.videos.some((v) => v.id === clip.videoId) ? clip.videoId : state.activeVideoId
+  }
+  return state.activeVideoId
+}
+
+/** Resolve the imported source behind a clip (for playback, labels, stats). */
+export function clipVideoSource(state: Pick<EditorState, 'videos' | 'activeVideoId'>, clip: Clip): VideoSource | null {
+  const id = clipSourceId(state, clip)
+  return (id !== null && state.videos.find((v) => v.id === id)) || null
+}
+
+/** All clips of one source, in timeline order. */
+export function clipsOfSource(state: EditorState, videoId: string): Clip[] {
+  return state.clips.filter((c) => clipSourceId(state, c) === videoId)
+}
+
+/** Pure transition wrapping: keeps the derived `cutPlan` in sync everywhere. */
 export function editorReducer(state: EditorState, action: EditorAction): EditorState {
+  return withActiveCutPlan(baseEditorReducer(state, action))
+}
+
+function baseEditorReducer(state: EditorState, action: EditorAction): EditorState {
   switch (action.type) {
     case 'VIDEO_ADDED': {
       const video: VideoSource = {
@@ -144,31 +195,31 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         durationMs: action.durationMs,
         mixdown: null,
       }
-      // Fresh import of this source: same fresh-edit reset as before plus the
-      // source joining (not replacing) the created videos list.
+      // NLE-style appending: a fresh import drops a full-length clip at the END
+      // of the track instead of wiping it, so clips accumulate endlessly. The
+      // rest of the edit (prefs, props, other sources) stays untouched.
+      const clips = video.durationMs > 0 ? appendClip(state.clips, { startMs: 0, endMs: video.durationMs }, video.id) : state.clips
       return {
-        ...initialEditorState,
+        ...state,
+        analysisProgress: 0,
         videos: [...state.videos, video],
         activeVideoId: video.id,
         project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, mixdown: null },
+        clips,
+        playing: false,
       }
     }
 
     case 'VIDEO_SELECTED': {
       const video = state.videos.find((v) => v.id === action.id)
       if (!video) return state
-      // Switching sources invalidates cuts and props (they belong to the
-      // previous media); user prefs (blur, fit, rotation) carry over.
+      // Switching only retargets the cut/analysis tools; the one track now
+      // spans every import, so clips and props are left untouched.
       return {
         ...state,
         activeVideoId: video.id,
         project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, mixdown: video.mixdown },
-        clips: [],
-        cutPlan: null,
-        props: [],
-        selectedPropId: null,
         playing: false,
-        playheadMs: 0,
       }
     }
 
@@ -189,9 +240,14 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       }
     }
 
-    case 'SILENCE_CONFIG_SET':
-      // changing parameters invalidates the last plan
-      return { ...state, silenceConfig: { ...state.silenceConfig, ...action.config }, cutPlan: null }
+    case 'SILENCE_CONFIG_SET': {
+      // changing parameters invalidates the ACTIVE source's plan
+      return {
+        ...state,
+        silenceConfig: { ...state.silenceConfig, ...action.config },
+        cutPlans: state.activeVideoId !== null ? withoutKey(state.cutPlans, state.activeVideoId) : state.cutPlans,
+      }
+    }
 
     case 'CLIP_DELETED': {
       // Keep the playhead inside the shrunken timeline so the preview never
@@ -200,23 +256,71 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       if (clips.length === state.clips.length) return state
       return { ...state, clips, playheadMs: clamp(state.playheadMs, 0, timelineDurationMs(clips)) }
     }
-    case 'CUT_APPLIED':
-      return {
-        ...state,
-        clips: clipsFromKeepSegments(action.cutPlan.keepSegments),
-        cutPlan: action.cutPlan,
-        playing: false,
-        playheadMs: 0,
-      }
 
-    case 'RESET_CUTS':
+    case 'CUT_APPLIED': {
+      // Silence cutting is per-source: the active source's clips are replaced
+      // by its kept segments in place; every other import's clips survive.
+      const target = state.activeVideoId
+      if (!target) return state
+      const isTarget = (c: Clip) => clipSourceId(state, c) === target
+      const without = state.clips.filter((c) => !isTarget(c))
+      const first = state.clips.findIndex(isTarget)
+      // generated ids may collide with clips that stay on the track
+      const used = new Set(without.map((c) => c.id))
+      const replacement = clipsFromKeepSegments(action.cutPlan.keepSegments).map((c) => {
+        const id = used.has(c.id) ? makeClipId() : c.id
+        used.add(id)
+        return { ...c, id, videoId: target }
+      })
+      const clips =
+        first === -1
+          ? [...without, ...replacement] // no prior clips of this source: grow the track
+          : [...without.slice(0, first), ...replacement, ...without.slice(first)]
       return {
         ...state,
-        clips: [],
-        cutPlan: null,
+        clips,
+        cutPlans: { ...state.cutPlans, [target]: action.cutPlan },
         playing: false,
-        playheadMs: 0,
+        playheadMs: clamp(state.playheadMs, 0, timelineDurationMs(clips)),
       }
+    }
+
+    case 'RESET_CUTS': {
+      // "Reset" restores the ACTIVE source to one uncut full-length clip where
+      // its cut clips lived; other imports keep their timeline presence.
+      const target = state.activeVideoId
+      if (!target) return state
+      const source = state.videos.find((v) => v.id === target)
+      const isTarget = (c: Clip) => clipSourceId(state, c) === target
+      const first = state.clips.findIndex(isTarget)
+      if (first === -1 && (source === undefined || source.durationMs <= 0)) return state
+      const full: Clip | null =
+        source && source.durationMs > 0
+          ? { id: makeClipId(), videoId: target, srcStartMs: 0, srcEndMs: source.durationMs, zoom: 1 }
+          : null
+      const without = state.clips.filter((c) => !isTarget(c))
+      const clips =
+        full === null
+          ? without
+          : first === -1
+            ? [...without, full]
+            : [...without.slice(0, first), full, ...without.slice(first)]
+      return {
+        ...state,
+        clips,
+        cutPlans: withoutKey(state.cutPlans, target),
+        playing: false,
+        playheadMs: clamp(state.playheadMs, 0, timelineDurationMs(clips)),
+      }
+    }
+
+    case 'CLIP_APPEND': {
+      // Append a whole source as one more clip at the end of the track.
+      const target = action.videoId ?? state.activeVideoId
+      const source = target !== null ? state.videos.find((v) => v.id === target) : undefined
+      if (!source || source.durationMs <= 0) return state
+      return { ...state, clips: appendClip(state.clips, { startMs: 0, endMs: source.durationMs }, source.id) }
+    }
 
     case 'AUTO_ZOOM':
       return { ...state, clips: applyAutoZoom(state.clips) }

@@ -1,5 +1,6 @@
 import { useRef, type DragEvent } from 'react'
 import { useEditor } from '../../app/state/EditorProvider'
+import { clipsOfSource } from '../../app/state/editor'
 import { PanelSection } from '../shared/ui/PanelSection'
 import { MOTION_PRESET_NAMES, type MotionPresetName } from '../motion/engine'
 
@@ -35,7 +36,7 @@ function SliderRow({ label, value, min, max, step, suffix, onChange }: {
 
 /** Left rail: media import (single or multiple videos), jump-cut controls, blur, and props. */
 export function MediaRail() {
-  const { state, importVideo, selectVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
+  const { state, importVideo, selectVideo, addTimelineClip, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const propInputRef = useRef<HTMLInputElement>(null)
 
@@ -44,8 +45,10 @@ export function MediaRail() {
   const hasClips = state.clips.length > 0
   const isCutApplied = state.cutPlan !== null
 
+  // Stats track the ACTIVE source only: the one track spans all imports.
+  const activeClips = (state.activeVideoId !== null ? clipsOfSource(state, state.activeVideoId) : [])
   const origSec = Math.round((state.project?.durationMs ?? 0) / 100) / 10
-  const cutSec = Math.round(state.clips.reduce((acc, c) => acc + (c.srcEndMs - c.srcStartMs), 0) / 100) / 10
+  const cutSec = Math.round(activeClips.reduce((acc, c) => acc + (c.srcEndMs - c.srcStartMs), 0) / 100) / 10
   const savedSec = Math.max(0, Math.round((origSec - cutSec) * 10) / 10)
   const pctFaster = origSec > 0 ? Math.round((savedSec / origSec) * 100) : 0
 
@@ -69,8 +72,16 @@ export function MediaRail() {
               <p className="mt-1 tabular-nums">{Math.round((state.project?.durationMs ?? 0) / 100) / 10}s source</p>
               <button
                 type="button"
-                onClick={() => fileInputRef.current?.click()}
+                onClick={() => addTimelineClip()}
                 className="mt-2 text-[11px] text-accent underline-offset-2 hover:underline"
+                title="Appends this full video as one more clip at the end of the timeline"
+              >
+                + Add to timeline
+              </button>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="mt-2 block text-[11px] text-accent underline-offset-2 hover:underline"
               >
                 Import another video
               </button>
@@ -105,11 +116,15 @@ export function MediaRail() {
                 const active = video.id === state.activeVideoId
                 return (
                   <li key={video.id}>
-                    <button
-                      type="button"
+                    <div
+                      role="button"
+                      tabIndex={0}
                       title={active ? 'Currently editing' : `Switch to ${video.fileName}`}
                       onClick={() => selectVideo(video.id)}
-                      className={`flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] transition-colors ${
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') selectVideo(video.id)
+                      }}
+                      className={`flex w-full cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] transition-colors ${
                         active ? 'bg-zinc-800/80 text-zinc-200' : 'text-zinc-500 hover:bg-zinc-800/40'
                       }`}
                     >
@@ -118,7 +133,19 @@ export function MediaRail() {
                       <span className="shrink-0 tabular-nums text-zinc-600">
                         {Math.round(video.durationMs / 100) / 10}s
                       </span>
-                    </button>
+                      <button
+                        type="button"
+                        aria-label={`Add ${video.fileName} to the timeline`}
+                        title="Append this full video at the end of the timeline"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          addTimelineClip(video.id)
+                        }}
+                        className="shrink-0 rounded border border-line px-1.5 py-0.5 text-[11px] leading-none text-zinc-300 transition-colors hover:bg-zinc-700/60 hover:text-zinc-100"
+                      >
+                        +
+                      </button>
+                    </div>
                   </li>
                 )
               })}
@@ -142,7 +169,7 @@ export function MediaRail() {
                   Silence Cut Applied
                 </span>
                 <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300 font-mono">
-                  {state.clips.length} clips
+                  {activeClips.length} clips
                 </span>
               </div>
               <div className="flex items-center justify-between text-[11px] text-zinc-400 pt-1 border-t border-emerald-900/40">

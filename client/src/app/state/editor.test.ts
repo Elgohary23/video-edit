@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { editorReducer, initialEditorState, type EditorState } from './editor'
+import { clipSourceId, clipVideoSource, clipsOfSource, editorReducer, initialEditorState, type EditorState } from './editor'
+import { timelineStartOfClip } from '../../modules/timeline/engine'
 
 function stateWithClip(): EditorState {
   const base = editorReducer(initialEditorState, {
@@ -22,20 +23,31 @@ function stateWithClip(): EditorState {
 }
 
 describe('media actions', () => {
-  it('import adds to the video list, becomes active, and resets the edit state', () => {
+  it('import appends a full-length clip to the track and keeps the edit so far', () => {
     const withClip = stateWithClip()
     const next = editorReducer(withClip, { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
-    expect(next.clips).toEqual([])
-    expect(next.props).toEqual([])
+    // the track grows instead of resetting: vid-1's segments stay, then b.mp4
+    expect(next.clips).toHaveLength(3)
+    expect(next.clips[2]).toMatchObject({ videoId: 'vid-2', srcStartMs: 0, srcEndMs: 10, zoom: 1 })
+    expect(next.props).toEqual(withClip.props)
     expect(next.project?.fileName).toBe('b.mp4')
     expect(next.playing).toBe(false)
-    // multi-video: the new source joins the list and takes over
+    // multi-video: the new source joins the list and takes over the edit target
     expect(next.videos).toHaveLength(2)
     expect(next.videos[0]).toMatchObject({ id: 'vid-1', fileName: 'take.mp4' })
     expect(next.activeVideoId).toBe('vid-2')
+    // the derived plan follows the active source (vid-2 has none yet)
+    expect(next.cutPlan).toBeNull()
+    expect(next.cutPlans['vid-1']).toBeDefined()
   })
 
-  it('selecting an imported video makes it active, restores its mixdown, resets edits', () => {
+  it('a durationless import still joins the list but adds no empty clip', () => {
+    const next = editorReducer(stateWithClip(), { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 0 })
+    expect(next.clips).toHaveLength(2)
+    expect(next.clips.every((c) => c.videoId === 'vid-1')).toBe(true)
+  })
+
+  it('selecting an imported video retargets the tools but keeps the one track', () => {
     const twoVideos = stateWithClip()
     const second = editorReducer(twoVideos, { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
     const analyzed = editorReducer(second, {
@@ -50,9 +62,26 @@ describe('media actions', () => {
     expect(back.project?.fileName).toBe('take.mp4')
     expect(back.project?.mixdown?.sampleRate).toBe(1000) // vid-1's analysis follows it
     expect(back.videos).toHaveLength(2) // the other source stays in the list
-    expect(back.clips).toEqual([]) // vid-2's edits don't leak
-    expect(back.cutPlan).toBeNull()
+    // the track survives switching — both sources' clips keep their order
+    expect(back.clips).toEqual(analyzed.clips)
+    expect(back.props).toEqual(analyzed.props)
+    // the derived plan belongs to vid-1 again
+    expect(back.cutPlan?.cutRegions).toEqual([{ startMs: 1000, endMs: 1200 }])
     expect(editorReducer(analyzed, { type: 'VIDEO_SELECTED', id: 'nope' })).toBe(analyzed)
+  })
+
+  it('clipSourceId resolves explicit ids; legacy clips follow the active source', () => {
+    const s = stateWithClip()
+    expect(clipSourceId(s, s.clips[0])).toBe('vid-1')
+    const legacy = { id: 'clip-x', srcStartMs: 0, srcEndMs: 1, zoom: 1 }
+    expect(clipSourceId(s, legacy)).toBe('vid-1')
+    expect(clipVideoSource(s, legacy)?.fileName).toBe('take.mp4')
+    // a dangling videoId falls back to the active source too
+    expect(clipSourceId(s, { ...legacy, videoId: 'ghost' })).toBe('vid-1')
+    const two = editorReducer(s, { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
+    expect(clipVideoSource(two, two.clips[2])?.fileName).toBe('b.mp4')
+    expect(clipsOfSource(two, 'vid-2')).toHaveLength(1)
+    expect(clipsOfSource(two, 'vid-1')).toHaveLength(2)
   })
 
   it('analysis progress clamps and done fills mixdown of the named source', () => {
@@ -91,6 +120,85 @@ describe('silence config + cut', () => {
     const s = stateWithClip()
     expect(s.clips).toHaveLength(2)
     expect(s.cutPlan?.cutRegions).toEqual([{ startMs: 1000, endMs: 1200 }])
+  })
+})
+
+describe('endless appending (one track, many clips)', () => {
+  it('CLIP_APPEND appends the full source at the end of the track', () => {
+    const two = editorReducer(stateWithClip(), { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
+    const grown = editorReducer(two, { type: 'CLIP_APPEND', videoId: 'vid-2' })
+    expect(grown.clips).toHaveLength(4)
+    const last = grown.clips[3]
+    expect(last).toMatchObject({ videoId: 'vid-2', srcStartMs: 0, srcEndMs: 10, zoom: 1 })
+    // appended after vid-2's own seeded clip — starts exactly where the track ended
+    expect(timelineStartOfClip(grown.clips, 3)).toBe(2810)
+    expect(grown.clips.slice(0, 3).reduce((a, c) => a + (c.srcEndMs - c.srcStartMs), 0)).toBe(timelineStartOfClip(grown.clips, 3))
+  })
+  it('CLIP_APPEND without a resolvable source is a no-op (same reference)', () => {
+    const s = stateWithClip()
+    expect(editorReducer(s, { type: 'CLIP_APPEND', videoId: 'ghost' })).toBe(s)
+    const empty = initialEditorState
+    expect(editorReducer(empty, { type: 'CLIP_APPEND' })).toBe(empty)
+  })
+})
+
+describe('per-source silence cuts on a shared track', () => {
+  const twoSources = () =>
+    editorReducer(stateWithClip(), { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
+
+  it('cutting the active source keeps the other import intact', () => {
+    const s = twoSources() // [clip-1(vid-1), clip-2(vid-1), b.mp4 full(vid-2)]
+    expect(s.activeVideoId).toBe('vid-2')
+    const cut = editorReducer(s, {
+      type: 'CUT_APPLIED',
+      cutPlan: {
+        cutRegions: [{ startMs: 2, endMs: 5 }],
+        keepSegments: [
+          { startMs: 0, endMs: 2 },
+          { startMs: 5, endMs: 10 },
+        ],
+      },
+    })
+    // vid-1's two clips stay before vid-2's two new segments
+    expect(cut.clips).toHaveLength(4)
+    expect(cut.clips[0]).toMatchObject({ videoId: 'vid-1', srcEndMs: 1000 })
+    expect(cut.clips[2]).toMatchObject({ videoId: 'vid-2', srcStartMs: 0, srcEndMs: 2 })
+    expect(cut.clips[3]).toMatchObject({ videoId: 'vid-2', srcStartMs: 5, srcEndMs: 10 })
+    expect(cut.cutPlan?.cutRegions).toEqual([{ startMs: 2, endMs: 5 }])
+  })
+
+  it('generated ids never collide with another source that already owns clip-1', () => {
+    const s = twoSources()
+    const cut = editorReducer(s, { type: 'CUT_APPLIED', cutPlan: { cutRegions: [], keepSegments: [{ startMs: 0, endMs: 10 }] } })
+    const ids = cut.clips.map((c) => c.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(ids[0]).toBe('clip-1') // vid-1's original untouched
+    expect(ids[2]).not.toBe('clip-1') // vid-2's replacement got a fresh id
+  })
+
+  it('reset restores only the active source to one full clip, in place', () => {
+    const s = twoSources()
+    const cut = editorReducer(s, {
+      type: 'CUT_APPLIED',
+      cutPlan: { cutRegions: [{ startMs: 2, endMs: 5 }], keepSegments: [{ startMs: 0, endMs: 2 }, { startMs: 5, endMs: 10 }] },
+    })
+    const reset = editorReducer(cut, { type: 'RESET_CUTS' })
+    expect(reset.clips).toHaveLength(3)
+    expect(reset.clips[2]).toMatchObject({ videoId: 'vid-2', srcStartMs: 0, srcEndMs: 10 })
+    expect(reset.cutPlan).toBeNull() // vid-2's plan cleared
+    expect(reset.clips[0].videoId).toBe('vid-1') // vid-1 keeps its cut clips
+  })
+
+  it('silence config change only invalidates the active plan', () => {
+    const s = twoSources() // active = vid-2 (no plan)
+    const cutVid2 = editorReducer(s, { type: 'CUT_APPLIED', cutPlan: { cutRegions: [], keepSegments: [{ startMs: 0, endMs: 10 }] } })
+    expect(cutVid2.cutPlan).not.toBeNull()
+    // switch to vid-1 (has a plan), tinker config → vid-1's plan drops
+    const back = editorReducer(cutVid2, { type: 'VIDEO_SELECTED', id: 'vid-1' })
+    expect(back.cutPlan?.cutRegions).toEqual([{ startMs: 1000, endMs: 1200 }])
+    const after = editorReducer(back, { type: 'SILENCE_CONFIG_SET', config: { paddingMs: 200 } })
+    expect(after.cutPlan).toBeNull()
+    expect(after.silenceConfig.paddingMs).toBe(200)
   })
 })
 

@@ -20,6 +20,11 @@ export interface Clip {
   srcEndMs: number
   /** Framing scale for this clip (1 = base, >1 = punch-in). */
   zoom: number
+  /**
+   * Which imported source this clip cuts from (one track can grow across
+   * several files). Omitted on legacy clips — they follow the active source.
+   */
+  videoId?: string
 }
 
 export interface PlacedSource {
@@ -41,6 +46,27 @@ export function clipsFromKeepSegments(segments: Region[]): Clip[] {
     srcEndMs: seg.endMs,
     zoom: 1,
   }))
+}
+
+/** Collision-safe id for clips appended by hand or by an import. */
+export function makeClipId(): string {
+  return `clip-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+}
+
+/**
+ * NLE-style appending: push one more clip onto the end of the single track.
+ * Timeline position is derived from array order, so the new clip always starts
+ * exactly where the track currently ends — clips accumulate endlessly.
+ */
+export function appendClip(clips: Clip[], window: Region, videoId?: string, id?: string): Clip[] {
+  const clip: Clip = {
+    id: id ?? makeClipId(),
+    srcStartMs: window.startMs,
+    srcEndMs: window.endMs,
+    zoom: 1,
+    ...(videoId !== undefined ? { videoId } : {}),
+  }
+  return [...clips, clip]
 }
 
 /**

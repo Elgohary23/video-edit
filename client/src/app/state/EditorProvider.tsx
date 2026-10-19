@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, type ReactNode } from 'react'
-import { editorReducer, initialEditorState, type EditorState, type PropItem, type FitMode } from './editor'
+import { editorReducer, initialEditorState, clipVideoSource, type EditorState, type PropItem, type FitMode } from './editor'
 import { dbEnvelope, buildCutPlan, type SilenceConfig } from '../../modules/audio-analysis/engine'
 import { mixdownToMono, type AudioBufferLike } from '../../modules/media/engine'
 import { resolveMotion } from '../../modules/motion/engine'
@@ -43,6 +43,8 @@ export interface EditorContextValue {
   fetchProjectList: () => Promise<SavedProjectSummary[]>
   applySavedProject: (id: string) => Promise<void>
   selectVideo: (id: string) => void
+  /** NLE-style appending: drop one more full clip at the end of the track. */
+  addTimelineClip: (videoId?: string) => void
   registerCanvas: (canvas: HTMLCanvasElement | null) => void
   message: string
   deleteClip: (clipId: string) => void
@@ -97,10 +99,14 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     const video = videoRef.current
     if (!video) return
     const onEnded = () => {
+      // Only treat 'ended' as playback-finish when the timeline is truly over;
+      // mid-timeline source hops swap <video> srcs and must not reset the edit.
+      const s = stateRef.current
+      if (timelineDurationMs(s.clips) - s.playheadMs > 50) return
       // Reset playhead and video position when playback finishes
       dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: 0 })
       video.currentTime = 0
-      if (!exportingRef.current && stateRef.current.playing) {
+      if (!exportingRef.current && s.playing) {
         dispatch({ type: 'PLAYBACK_SET', playing: false })
       }
     }
@@ -109,16 +115,6 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       video.removeEventListener('ended', onEnded)
     }
   }, [])
-
-  /** The playback element always mirrors the active source (import/switch). */
-  useEffect(() => {
-    const video = videoRef.current
-    const url = state.project?.videoUrl
-    if (!video || !url || video.src === url) return
-    video.pause()
-    video.src = url
-    video.currentTime = 0
-  }, [state.project?.videoUrl])
 
   /** Decode a specific import's audio track; the reducer attaches it by id. */
   async function extractAudio(url: string, videoId: string): Promise<void> {
@@ -175,6 +171,11 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   /** Switch the active editing source among the imported videos. */
   const selectVideo = useCallback((id: string) => {
     dispatch({ type: 'VIDEO_SELECTED', id })
+  }, [])
+
+  /** Drop one more full clip of a source (default: active) at the track end. */
+  const addTimelineClip = useCallback((videoId?: string) => {
+    dispatch({ type: 'CLIP_APPEND', videoId })
   }, [])
 
   const autoZoom = useCallback(() => dispatch({ type: 'AUTO_ZOOM' }), [])
@@ -288,7 +289,21 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       const settings = buildCompositorSettings(s, videoSource, video)
       drawFrame(ctx, canvas.width, canvas.height, settings)
 
-      if (!s.playing || !video || !s.project) return
+      if (!video) return
+
+      // The playback element follows the source of the clip under the playhead,
+      // so the single growing track can hold clips from several imports: hop
+      // <video> srcs whenever the playhead crosses a clip's source boundary.
+      const followTotal = timelineDurationMs(s.clips)
+      const follow = timelineToSource(s.clips, Math.min(s.playheadMs, Math.max(0, followTotal - 1)))
+      const followSource = follow ? clipVideoSource(s, follow.clip) : null
+      if (followSource && video.src !== followSource.videoUrl) {
+        video.pause()
+        video.src = followSource.videoUrl
+        video.currentTime = (follow?.srcMs ?? 0) / 1000
+      }
+
+      if (!s.playing || !s.project) return
 
       const clips = s.clips
       const place = timelineToSource(clips, s.playheadMs)
@@ -337,7 +352,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     const video = videoRef.current
     const canvas = canvasRef.current
     if (!s.project || !video || !canvas || s.clips.length === 0) {
-      setMessage('Import a video and cut silence before exporting.')
+      setMessage('Import a video before exporting.')
       return
     }
     const recorderMime = pickRecorderMimeType((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m))
@@ -348,7 +363,11 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
     try {
       video.pause()
-      video.currentTime = 0
+      // Start from the first clip's own source (the track can span imports)
+      const open = timelineToSource(s.clips, 0)
+      const openSource = open ? clipVideoSource(s, open.clip) : null
+      if (openSource && video.src !== openSource.videoUrl) video.src = openSource.videoUrl
+      video.currentTime = (open?.srcMs ?? 0) / 1000
       await once(video, 'seeked')
 
       // audio: route the element into the graph, capture via stream destination
@@ -525,11 +544,12 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       fetchProjectList,
       applySavedProject,
       selectVideo,
+      addTimelineClip,
       registerCanvas,
       message,
       deleteClip,
     }),
-    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
+    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
   )
 
   return (

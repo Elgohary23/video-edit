@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { useEditor } from '../../app/state/EditorProvider'
-import type { VideoSource } from '../../app/state/editor'
+import { clipVideoSource, clipsOfSource, type VideoSource } from '../../app/state/editor'
 import { computePeaks } from '../audio-analysis/engine'
 import { timelineDurationMs, timelineStartOfClip } from '../timeline/engine'
 import { clamp } from '../shared/utils'
@@ -9,6 +9,8 @@ import { ClipDeleteButton } from './ClipDeleteButton'
 const WAVE_HEIGHT = 72
 const ZOOM_MAX = 4
 const ZOOM_STEP = 0.5
+/** Wheel zoom sensitivity (per notch, multiplicative around 1.0). */
+const WHEEL_ZOOM_RATE = 0.0012
 
 interface LaneDrag {
   kind: 'clip-start' | 'clip-end' | 'prop-start' | 'prop-end'
@@ -33,6 +35,53 @@ export function TimelinePanel() {
   /* ── timeline zoom (1x native, up to 4x, scrollable) ──────────────────── */
 
   const [zoom, setZoom] = useState(1)
+
+  /* ── wheel zoom over the timeline lanes (roller in/out, cursor-anchored) ── */
+
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const lanesRef = useRef<HTMLDivElement>(null)
+  const zipRef = useRef({ zoom, hasMedia: state.project !== null })
+  zipRef.current = { zoom, hasMedia: state.project !== null }
+  /** Anchor captured at wheel time; applied after the zoom re-render. */
+  const pendingAnchor = useRef<{ frac: number; clientX: number } | null>(null)
+
+  useEffect(() => {
+    const container = scrollRef.current
+    if (!container) return
+    const onWheel = (e: WheelEvent) => {
+      // horizontal trackpad/shift-scroll keeps native panning; the vertical
+      // roller zooms in/out like the buttons do
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return
+      const { zoom: z, hasMedia } = zipRef.current
+      if (!hasMedia) return
+      e.preventDefault()
+      const lane = lanesRef.current
+      if (!lane) return
+      const laneRect = lane.getBoundingClientRect()
+      const containerRect = container.getBoundingClientRect()
+      if (laneRect.width <= 0) return
+      // fraction of the lane under the cursor stays put while zooming
+      const frac = (e.clientX - laneRect.left) / laneRect.width
+      const next = clamp(z * Math.exp(-e.deltaY * WHEEL_ZOOM_RATE), 1, ZOOM_MAX)
+      if (next === z) return
+      pendingAnchor.current = { frac, clientX: e.clientX - containerRect.left }
+      zipRef.current = { zoom: next, hasMedia }
+      setZoom(next)
+    }
+    container.addEventListener('wheel', onWheel, { passive: false })
+    return () => container.removeEventListener('wheel', onWheel)
+  }, [])
+
+  useEffect(() => {
+    const anchor = pendingAnchor.current
+    if (!anchor) return
+    pendingAnchor.current = null
+    const lane = lanesRef.current
+    const container = scrollRef.current
+    if (!lane || !container) return
+    const laneWidth = lane.getBoundingClientRect().width
+    container.scrollLeft = clamp(anchor.frac * laneWidth - anchor.clientX, 0, container.scrollWidth)
+  }, [zoom])
 
   /* ── waveform rendering ───────────────────────────────────────────────── */
 
@@ -151,7 +200,7 @@ export function TimelinePanel() {
             {state.cutPlan !== null ? (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
                 <span className="size-1.5 rounded-full bg-emerald-400" />
-                Silence Cut Applied ({state.clips.length} clips)
+                Silence Cut Applied ({clipsOfSource(state, state.activeVideoId ?? '').length} clips)
               </span>
             ) : hasMedia ? (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-700 bg-zinc-800/80 px-2 py-0.5 text-[10px] text-zinc-400">
@@ -164,6 +213,7 @@ export function TimelinePanel() {
               {state.clips.length} clip{state.clips.length === 1 ? '' : 's'} · {state.props.length} prop
               {state.props.length === 1 ? '' : 's'}
             </span>
+            {hasMedia && <span className="hidden text-zinc-600 sm:inline">roller = zoom</span>}
           </div>
         </div>
 
@@ -214,8 +264,9 @@ export function TimelinePanel() {
           </div>
         )}
 
-        <div className="overflow-x-auto" style={{ maxHeight: 240 }}>
+        <div ref={scrollRef} className="overflow-x-auto overflow-y-hidden" style={{ maxHeight: 240 }}>
           <div
+            ref={lanesRef}
             className="relative space-y-2"
             data-all-lanes
             style={{ width: `${zoom * 100}%`, minWidth: '100%' }}
@@ -248,12 +299,13 @@ export function TimelinePanel() {
             <div className="relative h-9 overflow-hidden rounded-lg bg-zinc-900" data-lane>
               {empty && (
                 <span className="absolute inset-0 grid place-items-center text-[11px] text-zinc-600">
-                  {hasMedia ? 'Run "Apply silence cut" to build clips' : 'Import a video to begin'}
+                  {hasMedia ? 'Track empty — add a clip from the media panel' : 'Import a video to begin'}
                 </span>
               )}
               {state.clips.map((clip, i) => {
                 const startTL = timelineStartOfClip(state.clips, i)
                 const span = clip.srcEndMs - clip.srcStartMs
+                const source = clipVideoSource(state, clip)
                 return (
                   <div
                     key={clip.id}
@@ -263,11 +315,11 @@ export function TimelinePanel() {
                       width: `max(0.5%, ${pct(span)}%)`,
                       background: clip.zoom > 1 ? 'rgba(139, 92, 246, 0.25)' : undefined,
                     }}
-                    title={`${clip.id} (zoom ${Math.round(clip.zoom * 100)}% · double-click to split)`}
+                    title={`${source?.fileName ?? clip.id} · zoom ${Math.round(clip.zoom * 100)}% · double-click to split`}
                     onDoubleClick={() => splitClipAt(clip.id, state.playheadMs)}
                     onClick={() => seek(startTL)}
                   >
-                    <span className="truncate px-1.5">{clip.id}</span>
+                    <span className="truncate px-1.5">{source?.fileName ?? clip.id}</span>
                     <ClipDeleteButton clipId={clip.id} />
                     <div
                       role="separator"
