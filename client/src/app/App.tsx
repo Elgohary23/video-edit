@@ -5,13 +5,15 @@ import { MediaRail } from '../modules/media-rail/MediaRail'
 import { PreviewStage } from '../modules/preview/PreviewStage'
 import { TimelinePanel } from '../modules/timeline-ui/TimelinePanel'
 import { ScrubberBar } from '../modules/playback/ScrubberBar'
+import { ExportDialog } from '../modules/export/ui/ExportDialog'
+import { isExportBusy } from '../modules/export/types'
 
 /** Header actions + inline host for the load-project popover. */
 function Toolbar() {
-  const { state, saveProject, fetchProjectList, applySavedProject, exportToMp4 } = useEditor()
+  const { state, saveProject, fetchProjectList, applySavedProject, openExportDialog } = useEditor()
   const [projects, setProjects] = useState<SavedProjectSummary[] | null>(null)
   const hasMedia = state.project !== null
-  const busy = state.exportStatus.phase !== null
+  const busy = isExportBusy(state.exportStatus)
 
   return (
     <header className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2.5">
@@ -22,7 +24,12 @@ function Toolbar() {
       </div>
 
       <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
-        {state.exportStatus.phase !== null && <span className="animate-pulse text-accent">{state.exportStatus.detail}</span>}
+        {busy && (
+          <span className="animate-pulse text-accent">
+            {state.exportStatus.detail}
+            {state.exportStatus.progress != null ? ` · ${Math.round(state.exportStatus.progress * 100)}%` : ''}
+          </span>
+        )}
         <button
           type="button"
           onClick={async () => setProjects(await fetchProjectList())}
@@ -40,7 +47,7 @@ function Toolbar() {
         </button>
         <button
           type="button"
-          onClick={() => void exportToMp4()}
+          onClick={openExportDialog}
           disabled={!hasMedia || busy}
           className="rounded-lg bg-accent px-3 py-1.5 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
         >
@@ -114,6 +121,8 @@ function EditorShell() {
 
       {/* Floating scan bar — user-draggable, parks anywhere over the editor */}
       <ScrubberBar />
+
+      <ExportDialog />
     </div>
   )
 }

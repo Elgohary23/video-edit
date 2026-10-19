@@ -151,15 +151,23 @@ function shouldBlur(settings: CompositorSettings): boolean {
   return settings.blurEnabled && settings.activeProps.length > 0
 }
 
+/**
+ * The compositor works with both on-screen and offscreen 2D contexts, so the
+ * preview canvas and the dedicated export surface share one drawing path.
+ */
+export type CompositorContext = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
+
 /** Render one composited frame. Mutates only the passed context. */
-export function drawFrame(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, settings: CompositorSettings): void {
+export function drawFrame(ctx: CompositorContext, canvasW: number, canvasH: number, settings: CompositorSettings): void {
   ctx.clearRect(0, 0, canvasW, canvasH)
 
-  // Apply rotation if needed
-  if (settings.rotation && settings.rotation % 360 !== 0) {
+  // Apply rotation if needed. `save`/`restore` must always balance or the
+  // transform accumulates frame after frame in offscreen exports.
+  const rotated = Boolean(settings.rotation && settings.rotation % 360 !== 0)
+  if (rotated) {
     ctx.save()
     ctx.translate(canvasW / 2, canvasH / 2)
-    ctx.rotate((settings.rotation * Math.PI) / 180)
+    ctx.rotate(((settings.rotation ?? 0) * Math.PI) / 180)
     ctx.translate(-canvasW / 2, -canvasH / 2)
   }
 
@@ -219,4 +227,6 @@ export function drawFrame(ctx: CanvasRenderingContext2D, canvasW: number, canvas
     ctx.drawImage(prop.image, dest.x, dest.y, dest.w, dest.h)
     ctx.globalAlpha = 1
   }
+
+  if (rotated) ctx.restore()
 }

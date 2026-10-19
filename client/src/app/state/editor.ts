@@ -9,6 +9,8 @@ import { DEFAULT_SILENCE_CONFIG, type CutPlan, type SilenceConfig } from '../../
 import { MOTION_PRESET_NAMES, type MotionPresetName } from '../../modules/motion/engine'
 import { clamp } from '../../modules/shared/utils'
 import { defaultRect, type NormalizedRect } from '../../modules/props/engine'
+import { DEFAULT_EXPORT_SETTINGS, normalizeExportSettings } from '../../modules/export/settings'
+import { isExportBusy, type ExportSettings, type ExportStage } from '../../modules/export/types'
 
 export interface PropItem {
   id: string
@@ -45,8 +47,22 @@ export interface VideoSource {
 }
 
 export interface ExportStatus {
+  /**
+   * Legacy coarse phase kept for compatibility. New UI reads `stage`; the
+   * pipeline sets this to `transcoding` while it owns export resources.
+   */
   phase: 'recording' | 'transcoding' | null
   detail: string
+  stage?: ExportStage
+  /** Overall progress 0..1. */
+  progress?: number
+  /** Frames rasterized so far. */
+  frame?: number
+  totalFrames?: number
+  etaMs?: number | null
+  renderFps?: number | null
+  encodingSpeed?: number | null
+  error?: string | null
 }
 
 export type FitMode = 'contain' | 'cover';
@@ -81,6 +97,9 @@ export interface EditorState {
   playing: boolean
   playheadMs: number
   exportStatus: ExportStatus
+  /** Persisted export preferences (quality/resolution/fps/codec...). */
+  exportSettings: ExportSettings
+  exportDialogOpen: boolean
 }
 
 export type EditorAction =
@@ -117,6 +136,9 @@ export type EditorAction =
   | { type: 'PLAYBACK_SET'; playing: boolean; playheadMs?: number }
   | { type: 'PLAYHEAD_SET'; playheadMs: number }
   | { type: 'EXPORT_PHASE_SET'; phase: ExportStatus['phase']; detail?: string }
+  | { type: 'EXPORT_STATUS_SET'; status: ExportStatus }
+  | { type: 'EXPORT_SETTINGS_SET'; settings: Partial<ExportSettings> }
+  | { type: 'EXPORT_DIALOG_SET'; open: boolean }
   | {
       type: 'PROJECT_LOADED'
       project: { fileName: string; videoUrl: string; durationMs: number }
@@ -142,7 +164,20 @@ export const initialEditorState: EditorState = {
   rotation: 0,
   playing: false,
   playheadMs: 0,
-  exportStatus: { phase: null, detail: '' },
+  exportStatus: {
+    phase: null,
+    detail: '',
+    stage: 'idle',
+    progress: 0,
+    frame: 0,
+    totalFrames: 0,
+    etaMs: null,
+    renderFps: null,
+    encodingSpeed: null,
+    error: null,
+  },
+  exportSettings: { ...DEFAULT_EXPORT_SETTINGS },
+  exportDialogOpen: false,
 };
 
 /** Minimal in/out separation so motion presets always have room to play. */
@@ -406,6 +441,24 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
 
     case 'EXPORT_PHASE_SET':
       return { ...state, exportStatus: { phase: action.phase, detail: action.detail ?? state.exportStatus.detail } }
+
+    case 'EXPORT_STATUS_SET':
+      return {
+        ...state,
+        exportStatus: action.status,
+        // A fresh export always makes the detailed progress visible.
+        exportDialogOpen: action.status.stage === 'initializing' ? true : state.exportDialogOpen,
+      }
+
+    case 'EXPORT_SETTINGS_SET':
+      return { ...state, exportSettings: normalizeExportSettings({ ...state.exportSettings, ...action.settings }) }
+
+    case 'EXPORT_DIALOG_SET': {
+      // Keep the dialog (and its cancel button) pinned while resources are
+      // owned by the pipeline; closing would hide the only cancellation path.
+      if (!action.open && isExportBusy(state.exportStatus)) return state
+      return { ...state, exportDialogOpen: action.open }
+    }
 
     case 'PROJECT_LOADED':
       return {

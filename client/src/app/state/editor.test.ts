@@ -294,3 +294,59 @@ describe('blur', () => {
     expect(strong.blur.px).toBe(40)
   })
 })
+
+describe('export settings + dialog state', () => {
+  it('normalizes settings updates through the reducer', () => {
+    const next = editorReducer(initialEditorState, {
+      type: 'EXPORT_SETTINGS_SET',
+      settings: { fps: 60, resolution: '720p', width: 1, height: 1 },
+    })
+    expect(next.exportSettings.fps).toBe(60)
+    expect(next.exportSettings.width).toBe(720)
+    expect(next.exportSettings.height).toBe(1280)
+  })
+
+  it('stores detailed status and only auto-opens the dialog for a fresh export', () => {
+    const running = editorReducer(initialEditorState, {
+      type: 'EXPORT_STATUS_SET',
+      status: {
+        phase: 'transcoding',
+        detail: 'Rendering frames',
+        stage: 'rendering',
+        progress: 0.4,
+        frame: 12,
+        totalFrames: 30,
+        etaMs: 1000,
+        renderFps: 10,
+        encodingSpeed: null,
+        error: null,
+      },
+    })
+    expect(running.exportStatus.stage).toBe('rendering')
+    expect(running.exportStatus.progress).toBe(0.4)
+    expect(running.exportDialogOpen).toBe(false)
+
+    const initializing = editorReducer(running, {
+      type: 'EXPORT_STATUS_SET',
+      status: { ...running.exportStatus, stage: 'initializing' },
+    })
+    expect(initializing.exportDialogOpen).toBe(true)
+  })
+
+  it('refuses to close the dialog while the pipeline is busy', () => {
+    const busy = editorReducer(initialEditorState, {
+      type: 'EXPORT_STATUS_SET',
+      status: { phase: 'transcoding', detail: 'Encoding', stage: 'encoding' },
+    })
+    const opened = editorReducer(busy, { type: 'EXPORT_DIALOG_SET', open: true })
+    const attempt = editorReducer(opened, { type: 'EXPORT_DIALOG_SET', open: false })
+    expect(attempt.exportDialogOpen).toBe(true)
+
+    const done = editorReducer(opened, {
+      type: 'EXPORT_STATUS_SET',
+      status: { phase: null, detail: 'Export complete', stage: 'done' },
+    })
+    const closed = editorReducer(done, { type: 'EXPORT_DIALOG_SET', open: false })
+    expect(closed.exportDialogOpen).toBe(false)
+  })
+})

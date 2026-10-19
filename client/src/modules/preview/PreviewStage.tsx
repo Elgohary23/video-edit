@@ -5,6 +5,7 @@ import { hitTest, type Handle, type NormalizedRect } from '../props/engine'
 import { resolveMotion } from '../motion/engine'
 import { timelineDurationMs } from '../timeline/engine'
 import { PREVIEW_FRAME } from '../compositor/engine'
+import { isExportBusy } from '../export/types'
 
 interface DragSession {
   propId: string
@@ -23,7 +24,7 @@ interface DragSession {
  * one resolution regardless of the source video's aspect.
  */
 export function PreviewStage() {
-  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, exportToMp4, importVideo, setFitMode } = useEditor()
+  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, openExportDialog, importVideo, setFitMode } = useEditor()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const [drag, setDrag] = useState<DragSession | null>(null)
@@ -35,7 +36,7 @@ export function PreviewStage() {
 
   const totalMs = timelineDurationMs(state.clips)
   const isPlaying = state.playing
-  const busy = state.exportStatus.phase !== null
+  const busy = isExportBusy(state.exportStatus)
 
   /* Prop drag/resize via pointer capture on the prop element itself. */
 
@@ -234,12 +235,12 @@ export function PreviewStage() {
         </div>
 
         <div className="flex items-center gap-2">
-          {state.exportStatus.phase !== null && (
-            <span className="animate-pulse text-accent">{state.exportStatus.detail || state.exportStatus.phase}</span>
+          {busy && (
+            <span className="animate-pulse text-accent">{state.exportStatus.detail || state.exportStatus.stage}</span>
           )}
           <button
             type="button"
-            onClick={() => void exportToMp4()}
+            onClick={openExportDialog}
             disabled={totalMs === 0 || busy}
             className="rounded-lg bg-accent px-3 py-1.5 font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >

@@ -1,10 +1,12 @@
 /**
- * Export engine (PRD Feature 6) — two stages:
- *   1. record the composited canvas + mixed audio with MediaRecorder (webm take)
- *   2. transcode the take locally to MP4 (H.264/AAC) with FFmpeg.wasm
+ * Legacy export facade (PRD Feature 6 planning helpers).
  *
- * Pure planning logic (args, mime picking, filenames) is unit-tested;
- * the wasm wrapper is a thin adapter with explicit phases for the UI.
+ * The editor now exports through the offline pipeline (`runExport`), which
+ * renders frame-by-frame on a dedicated surface and streams chunk segments
+ * through FFmpeg.wasm. This module keeps the original helpers
+ * (`transcodeArgs`, `pickRecorderMimeType`, `exportFileName`, the cached
+ * `loadFfmpeg`) for compatibility and unit tests; the live export path no
+ * longer records the preview canvas.
  */
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'

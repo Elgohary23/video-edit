@@ -1,5 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, type ReactNode } from 'react'
-import { editorReducer, initialEditorState, clipVideoSource, type EditorState, type PropItem, type FitMode } from './editor'
+import {
+  editorReducer,
+  initialEditorState,
+  clipVideoSource,
+  type EditorState,
+  type ExportStatus,
+  type PropItem,
+  type FitMode,
+} from './editor'
 import { dbEnvelope, buildCutPlan, type SilenceConfig } from '../../modules/audio-analysis/engine'
 import { mixdownToMono, type AudioBufferLike } from '../../modules/media/engine'
 import { resolveMotion } from '../../modules/motion/engine'
@@ -12,7 +20,10 @@ import {
 } from '../../modules/timeline/engine'
 import { moveRect, resizeRect, type Handle as PropHandle, type NormalizedRect } from '../../modules/props/engine'
 import { saveProject as apiSaveProject, listProjects, loadProject as apiLoadProject, type SavedProjectSummary } from '../../modules/projects/api'
-import { exportFileName, pickRecorderMimeType, transcodeToMp4 } from '../../modules/export/engine'
+import { runExport } from '../../modules/export/pipeline/exportPipeline'
+import { normalizeExportSettings } from '../../modules/export/settings'
+import { isExportBusy, type ExportProgress, type ExportSettings } from '../../modules/export/types'
+import { isExportCancelled, ExportError } from '../../modules/export/utils/errors'
 
 /** Runtime message surfaced in the header (save confirmations, export errors...). */
 export interface EditorContextValue {
@@ -38,7 +49,11 @@ export interface EditorContextValue {
   play: () => void
   pause: () => void
   seek: (tMs: number) => void
-  exportToMp4: () => Promise<void>
+  exportToMp4: (settings?: Partial<ExportSettings>) => Promise<void>
+  cancelExport: () => void
+  openExportDialog: () => void
+  closeExportDialog: () => void
+  setExportSettings: (settings: Partial<ExportSettings>) => void
   saveProject: () => Promise<void>
   fetchProjectList: () => Promise<SavedProjectSummary[]>
   applySavedProject: (id: string) => Promise<void>
@@ -67,8 +82,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   const stateRef = useRef(state)
   stateRef.current = state
 
-  const exportingRef = useRef<{ resolve: () => void } | null>(null)
-  const mediaGraphRef = useRef<{ ctx: AudioContext; source: MediaElementAudioSourceNode; dest: MediaStreamAudioDestinationNode } | null>(null)
+  /** One export at a time; abort is the single cancellation source of truth. */
+  const exportAbortRef = useRef<AbortController | null>(null)
   const [message, setMessage] = useReducerString()
 
   /* ── Import & audio decode ─────────────────────────────────────────────── */
@@ -106,9 +121,6 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       // Reset playhead and video position when playback finishes
       dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: 0 })
       video.currentTime = 0
-      if (!exportingRef.current && s.playing) {
-        dispatch({ type: 'PLAYBACK_SET', playing: false })
-      }
     }
     video.addEventListener('ended', onEnded)
     return () => {
@@ -279,6 +291,10 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       const canvas = canvasRef.current
       const video = videoRef.current
       if (!canvas) return
+      // The offline export owns the UI thread's heavy work. Skipping the
+      // preview compositor here leaves one CPU core for seeking/encoding and
+      // guarantees preview never reads export rendering state.
+      if (isExportBusy(s.exportStatus)) return
       const ctx = canvas.getContext('2d')
       if (!ctx) return
 
@@ -322,18 +338,12 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         dispatch({ type: 'PLAYHEAD_SET', playheadMs: clipTL + (srcT - place.clip.srcStartMs) })
       } else if (srcT >= place.clip.srcEndMs - SEEK_EPS) {
         // clip finished — hop to the next one or finish playback
-        const wasExporting = exportingRef.current !== null
         if (place.clipIndex + 1 < clips.length) {
           dispatch({ type: 'PLAYHEAD_SET', playheadMs: timelineStartOfClip(clips, place.clipIndex + 1) })
         } else {
           void video.play().catch(() => {})
           video.pause()
           dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: timelineDurationMs(clips) })
-          if (wasExporting) {
-            const resolve = exportingRef.current?.resolve
-            exportingRef.current = null
-            resolve?.()
-          }
         }
       } else if (!video.seeking) {
         // start of playback or manual seek: jump the source to the planned window
@@ -347,93 +357,159 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
   /* ── Export ────────────────────────────────────────────────────────────── */
 
-  const exportToMp4 = useCallback(async () => {
+  const exportToMp4 = useCallback(
+    async (override?: Partial<ExportSettings>) => {
+      const s = stateRef.current
+      if (!s.project || s.clips.length === 0) {
+        setMessage('Import a video before exporting.')
+        return
+      }
+      if (exportAbortRef.current) return
+
+      if (override) dispatch({ type: 'EXPORT_SETTINGS_SET', settings: override })
+      const settings = normalizeExportSettings({ ...s.exportSettings, ...override })
+      const totalFrames = Math.max(0, Math.ceil((timelineDurationMs(s.clips) * settings.fps) / 1000))
+      const controller = new AbortController()
+      exportAbortRef.current = controller
+
+      // Export never depends on preview playback: pause the transport and
+      // leave the canvas alone until the offline job finishes.
+      videoRef.current?.pause()
+      dispatch({ type: 'PLAYBACK_SET', playing: false })
+      dispatch({
+        type: 'EXPORT_STATUS_SET',
+        status: {
+          phase: 'transcoding',
+          detail: 'Preparing export…',
+          stage: 'initializing',
+          progress: 0,
+          frame: 0,
+          totalFrames,
+          etaMs: null,
+          renderFps: null,
+          encodingSpeed: null,
+          error: null,
+        },
+      })
+
+      try {
+        const result = await runExport(
+          {
+            projectName: s.project.fileName,
+            clips: s.clips,
+            videos: s.videos.map((video) => ({
+              id: video.id,
+              url: video.videoUrl,
+              mixdown: video.mixdown,
+            })),
+            activeVideoId: s.activeVideoId,
+            props: s.props.map((prop) => ({
+              id: prop.id,
+              src: prop.src,
+              rect: prop.rect,
+              range: prop.range,
+              preset: prop.preset,
+            })),
+            blur: s.blur,
+            fitMode: s.fitMode,
+            settings,
+            signal: controller.signal,
+          },
+          {
+            onProgress: (progress: ExportProgress) => {
+              dispatch({ type: 'EXPORT_STATUS_SET', status: statusFromProgress(progress, totalFrames) })
+            },
+            onLog: (line) => console.debug(line),
+          },
+        )
+
+        const outcome = await saveExportBlob(result.blob, result.filename, result.mimeType)
+        if (outcome === 'saved') {
+          setMessage('Export complete — video saved.')
+          return
+        }
+        if (outcome === 'cancelled') {
+          setMessage('Export finished, but the save dialog was cancelled.')
+          return
+        }
+        // No save dialog in this browser: fall back to a plain download.
+        const url = URL.createObjectURL(result.blob)
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download = result.filename
+        anchor.click()
+        window.setTimeout(() => URL.revokeObjectURL(url), 1_000)
+        setMessage('Export complete — download started.')
+      } catch (err) {
+        if (controller.signal.aborted || isExportCancelled(err)) {
+          const previous = stateRef.current.exportStatus
+          dispatch({
+            type: 'EXPORT_STATUS_SET',
+            status: {
+              ...previous,
+              phase: null,
+              stage: 'cancelled',
+              detail: 'Export cancelled',
+              etaMs: null,
+              renderFps: null,
+              encodingSpeed: null,
+              error: null,
+            },
+          })
+          setMessage('Export cancelled.')
+          return
+        }
+        console.error('[export] failed', err, err instanceof ExportError ? err.logs : [])
+        const userMessage = err instanceof ExportError ? err.userMessage : `Export failed: ${err instanceof Error ? err.message : 'unknown error'}`
+        const previous = stateRef.current.exportStatus
+        dispatch({
+          type: 'EXPORT_STATUS_SET',
+          status: {
+            ...previous,
+            phase: null,
+            stage: 'error',
+            detail: 'Export failed',
+            etaMs: null,
+            renderFps: null,
+            encodingSpeed: null,
+            error: userMessage,
+          },
+        })
+        setMessage(userMessage)
+      } finally {
+        exportAbortRef.current = null
+      }
+    },
+    [setMessage],
+  )
+
+  const cancelExport = useCallback(() => {
+    const controller = exportAbortRef.current
+    if (!controller) return
+    const previous = stateRef.current.exportStatus
+    dispatch({
+      type: 'EXPORT_STATUS_SET',
+      status: { ...previous, detail: 'Cancelling export…' },
+    })
+    controller.abort()
+  }, [])
+
+  const openExportDialog = useCallback(() => {
     const s = stateRef.current
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    if (!s.project || !video || !canvas || s.clips.length === 0) {
+    if (!s.project || s.clips.length === 0) {
       setMessage('Import a video before exporting.')
       return
     }
-    const recorderMime = pickRecorderMimeType((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m))
-    if (!recorderMime) {
-      setMessage('Recording is not supported in this browser.')
-      return
-    }
-
-    try {
-      video.pause()
-      // Start from the first clip's own source (the track can span imports)
-      const open = timelineToSource(s.clips, 0)
-      const openSource = open ? clipVideoSource(s, open.clip) : null
-      if (openSource && video.src !== openSource.videoUrl) video.src = openSource.videoUrl
-      video.currentTime = (open?.srcMs ?? 0) / 1000
-      await once(video, 'seeked')
-
-      // audio: route the element into the graph, capture via stream destination
-      const audioCtx = mediaGraphRef.current?.ctx ?? new AudioContext()
-      const source = mediaGraphRef.current?.source ?? audioCtx.createMediaElementSource(video)
-      const dest = mediaGraphRef.current?.dest ?? audioCtx.createMediaStreamDestination()
-      source.disconnect()
-      source.connect(dest)
-      mediaGraphRef.current = { ctx: audioCtx, source, dest }
-
-      const canvasStream = canvas.captureStream(30)
-      const stream = new MediaStream([...canvasStream.getVideoTracks(), ...dest.stream.getAudioTracks()])
-      const recorder = new MediaRecorder(stream, { mimeType: recorderMime })
-      const chunks: BlobPart[] = []
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data)
-      }
-      recorder.start(250)
-
-      // drive playback to the end, the compositor loop resolves on finish
-      const finished = new Promise<void>((resolve) => {
-        exportingRef.current = { resolve }
-      })
-      dispatch({ type: 'PLAYBACK_SET', playing: true, playheadMs: 0 })
-      dispatch({ type: 'EXPORT_PHASE_SET', phase: 'recording', detail: 'Capturing timeline…' })
-      await finished
-      recorder.stop()
-      await once(recorder, 'stop')
-
-      // restore speaker monitoring for normal previewing
-      source.disconnect()
-      source.connect(audioCtx.destination)
-
-      const take = new Blob(chunks, { type: recorderMime })
-      dispatch({ type: 'EXPORT_PHASE_SET', phase: 'transcoding', detail: 'Encoding MP4…' })
-      const { blob } = await transcodeToMp4(take, (f) => {
-        if (f === 'loading-core') dispatch({ type: 'EXPORT_PHASE_SET', phase: 'transcoding', detail: 'Loading FFmpeg…' })
-      })
-      dispatch({ type: 'EXPORT_PHASE_SET', phase: null, detail: '' })
-
-      const filename = exportFileName(s.project.fileName.replace(/\.[^.]+$/, ''))
-      const outcome = await saveMp4Blob(blob, filename)
-      if (outcome === 'saved') {
-        setMessage('Export complete — MP4 saved.')
-        return
-      }
-      if (outcome === 'cancelled') {
-        setMessage('Export cancelled.')
-        return
-      }
-      // No save dialog in this browser: fall back to a plain download.
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      a.click()
-      URL.revokeObjectURL(url)
-      setMessage('Export complete — MP4 saved.')
-    } catch (err) {
-      dispatch({ type: 'EXPORT_PHASE_SET', phase: null, detail: '' })
-      console.error(err)
-      setMessage(`Export failed: ${err instanceof Error ? err.message : 'unknown error'}`)
-    } finally {
-      exportingRef.current = null
-    }
+    dispatch({ type: 'EXPORT_DIALOG_SET', open: true })
   }, [setMessage])
+
+  const closeExportDialog = useCallback(() => {
+    dispatch({ type: 'EXPORT_DIALOG_SET', open: false })
+  }, [])
+
+  const setExportSettings = useCallback((settings: Partial<ExportSettings>) => {
+    dispatch({ type: 'EXPORT_SETTINGS_SET', settings })
+  }, [])
 
   /* ── Save / load projects ─────────────────────────────────────────────── */
 
@@ -540,6 +616,10 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       pause,
       seek,
       exportToMp4,
+      cancelExport,
+      openExportDialog,
+      closeExportDialog,
+      setExportSettings,
       saveProject,
       fetchProjectList,
       applySavedProject,
@@ -549,7 +629,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       message,
       deleteClip,
     }),
-    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
+    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, cancelExport, openExportDialog, closeExportDialog, setExportSettings, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
   )
 
   return (
@@ -568,10 +648,21 @@ export function useEditor(): EditorContextValue {
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-function once(target: EventTarget, event: string): Promise<void> {
-  return new Promise((resolve) => {
-    target.addEventListener(event, () => resolve(), { once: true })
-  })
+/** Map pipeline progress onto the reducer's serializable status shape. */
+function statusFromProgress(progress: ExportProgress, fallbackTotalFrames: number): ExportStatus {
+  const busy = isExportBusy({ stage: progress.stage })
+  return {
+    phase: busy ? 'transcoding' : null,
+    detail: progress.detail,
+    stage: progress.stage,
+    progress: progress.progress,
+    frame: progress.frame,
+    totalFrames: progress.totalFrames || fallbackTotalFrames,
+    etaMs: progress.etaMs,
+    renderFps: progress.renderFps,
+    encodingSpeed: progress.encodingSpeed,
+    error: null,
+  }
 }
 
 type SaveBlobOutcome = 'saved' | 'cancelled' | 'unavailable'
@@ -581,12 +672,13 @@ type SaveBlobOutcome = 'saved' | 'cancelled' | 'unavailable'
  * (Chromium-family). 'cancelled' is returned when the user backs out of the
  * dialog; 'unavailable' means the caller should fall back to a plain download.
  */
-async function saveMp4Blob(blob: Blob, filename: string): Promise<SaveBlobOutcome> {
+async function saveExportBlob(blob: Blob, filename: string, mimeType: string): Promise<SaveBlobOutcome> {
   if (typeof window.showSaveFilePicker !== 'function') return 'unavailable'
+  const extension = filename.slice(filename.lastIndexOf('.'))
   try {
     const handle = await window.showSaveFilePicker({
       suggestedName: filename,
-      types: [{ description: 'MP4 Video', accept: { 'video/mp4': ['.mp4'] } }],
+      types: [{ description: mimeType === 'video/webm' ? 'WebM Video' : 'MP4 Video', accept: { [mimeType]: [extension] } }],
     })
     const writable = await handle.createWritable()
     await writable.write(blob)
