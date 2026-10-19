@@ -11,8 +11,12 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
 
-/** Single-threaded ffmpeg core, loaded from CDN as blob URLs (Vite-safe). */
-const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd'
+/**
+ * Single-threaded ffmpeg core (ESM build: the library's module worker
+ * dynamically imports the core — see ffmpegSession.ts), loaded from the CDN
+ * as blob URLs (Vite-safe).
+ */
+const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm'
 
 export const RECORDED_INPUT_NAME = 'take.webm'
 export const COMPLETE_OUTPUT_NAME = 'cut.mp4'

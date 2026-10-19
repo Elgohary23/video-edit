@@ -10,7 +10,15 @@ import { toBlobURL } from '@ffmpeg/util'
 import { ExportError } from '../utils/errors'
 import type { FileLedger } from './fileLedger'
 
-export const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd'
+/**
+ * FFmpeg core location.
+ *
+ * Must be the ESM build: @ffmpeg/ffmpeg ≥0.12.15 always spawns a *module*
+ * worker, and that worker dynamically imports the core (`import()`), so the
+ * core has to expose an ESM default export. The UMD build exports nothing as
+ * a module, which surfaces as "failed to import ffmpeg-core.js".
+ */
+export const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm'
 
 export interface FfmpegLogEvent {
   type: string
@@ -68,9 +76,19 @@ export function loadFfmpeg(
   if (!loadPromise) {
     const pending = (async () => {
       const ffmpeg = ctor()
-      const { coreURL, wasmURL } = await loader({ baseUrl })
-      await ffmpeg.load({ coreURL, wasmURL })
-      return ffmpeg
+      try {
+        const { coreURL, wasmURL } = await loader({ baseUrl })
+        await ffmpeg.load({ coreURL, wasmURL })
+        return ffmpeg
+      } catch (error) {
+        // A failed load must not leak the worker that `ctor` just spawned.
+        try {
+          ffmpeg.terminate()
+        } catch {
+          // already gone
+        }
+        throw error
+      }
     })()
     loadPromise = pending
     pending.catch(() => {

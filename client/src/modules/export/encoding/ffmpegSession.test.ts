@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FFmpegSession, loadFfmpeg, resetFfmpegCache, type FfmpegLike } from './ffmpegSession'
+import { CORE_BASE_URL, FFmpegSession, loadFfmpeg, resetFfmpegCache, type FfmpegLike } from './ffmpegSession'
 import { FileLedger } from './fileLedger'
 
 interface StubOptions {
@@ -45,6 +45,16 @@ afterEach(() => {
   resetFfmpegCache()
 })
 
+describe('CORE_BASE_URL', () => {
+  it('points at the ESM core, because the library always spawns a module worker', () => {
+    // Regression guard for the runtime failure "failed to import
+    // ffmpeg-core.js": @ffmpeg/ffmpeg ≥0.12.15 dynamically imports the core
+    // inside a module worker, so a UMD core (no ESM default export) can never
+    // load.
+    expect(CORE_BASE_URL).toMatch(/\/dist\/esm$/)
+  })
+})
+
 describe('loadFfmpeg', () => {
   it('caches one instance and constructs it only once', async () => {
     const instance = createStub()
@@ -59,10 +69,12 @@ describe('loadFfmpeg', () => {
     expect(instance.load).toHaveBeenCalledWith({ coreURL: 'blob:core', wasmURL: 'blob:wasm' })
   })
 
-  it('drops the cache after a failed load so a retry is possible', async () => {
-    const ctor = vi.fn(() => createStub() as unknown as never)
+  it('drops the cache after a failed load and terminates the half-built instance', async () => {
+    const instance = createStub()
+    const ctor = vi.fn(() => instance as unknown as never)
     const failing = vi.fn().mockRejectedValue(new Error('network'))
     await expect(loadFfmpeg(failing, 'https://example.test', ctor)).rejects.toThrow('network')
+    expect(instance.terminate).toHaveBeenCalledTimes(1)
     await expect(
       loadFfmpeg(vi.fn().mockResolvedValue({ coreURL: 'a', wasmURL: 'b' }), 'https://example.test', ctor),
     ).resolves.toBeTruthy()
