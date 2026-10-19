@@ -33,9 +33,9 @@ function SliderRow({ label, value, min, max, step, suffix, onChange }: {
   )
 }
 
-/** Left rail: media import, jump-cut controls, blur, and props. */
+/** Left rail: media import (single or multiple videos), jump-cut controls, blur, and props. */
 export function MediaRail() {
-  const { state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
+  const { state, importVideo, selectVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const propInputRef = useRef<HTMLInputElement>(null)
 
@@ -51,8 +51,8 @@ export function MediaRail() {
 
   const onFileDrop = (e: DragEvent<HTMLElement>) => {
     e.preventDefault()
-    const file = e.dataTransfer.files?.[0]
-    if (file) importVideo(file)
+    const files = Array.from(e.dataTransfer.files ?? []).filter((f) => f.type === '' || f.type.startsWith('video/'))
+    files.forEach((f) => importVideo(f))
   }
 
   return (
@@ -72,7 +72,7 @@ export function MediaRail() {
                 onClick={() => fileInputRef.current?.click()}
                 className="mt-2 text-[11px] text-accent underline-offset-2 hover:underline"
               >
-                Replace file
+                Import another video
               </button>
             </>
           ) : (
@@ -91,13 +91,39 @@ export function MediaRail() {
             ref={fileInputRef}
             type="file"
             accept="video/*"
+            multiple
             className="hidden"
             onChange={(e) => {
-              const file = e.target.files?.[0]
-              if (file) importVideo(file)
+              const files = Array.from(e.target.files ?? [])
+              files.forEach((f) => importVideo(f))
               e.target.value = ''
             }}
           />
+          {state.videos.length > 1 && (
+            <ul className="mt-3 space-y-1 border-t border-line pt-3">
+              {state.videos.map((video) => {
+                const active = video.id === state.activeVideoId
+                return (
+                  <li key={video.id}>
+                    <button
+                      type="button"
+                      title={active ? 'Currently editing' : `Switch to ${video.fileName}`}
+                      onClick={() => selectVideo(video.id)}
+                      className={`flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] transition-colors ${
+                        active ? 'bg-zinc-800/80 text-zinc-200' : 'text-zinc-500 hover:bg-zinc-800/40'
+                      }`}
+                    >
+                      <span aria-hidden className={`size-1.5 shrink-0 rounded-full ${active ? 'bg-accent' : 'bg-zinc-600'}`} />
+                      <span className="min-w-0 flex-1 truncate">{video.fileName}</span>
+                      <span className="shrink-0 tabular-nums text-zinc-600">
+                        {Math.round(video.durationMs / 100) / 10}s
+                      </span>
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
         </div>
       </PanelSection>
 

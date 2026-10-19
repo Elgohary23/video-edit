@@ -42,6 +42,7 @@ export interface EditorContextValue {
   saveProject: () => Promise<void>
   fetchProjectList: () => Promise<SavedProjectSummary[]>
   applySavedProject: (id: string) => Promise<void>
+  selectVideo: (id: string) => void
   registerCanvas: (canvas: HTMLCanvasElement | null) => void
   message: string
   deleteClip: (clipId: string) => void
@@ -64,9 +65,6 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   const stateRef = useRef(state)
   stateRef.current = state
 
-  const srcUrlRef = useRef<string | null>(null)
-  const pendingImportRef = useRef<{ fileName: string } | null>(null)
-  const analysisSeqRef = useRef(0)
   const exportingRef = useRef<{ resolve: () => void } | null>(null)
   const mediaGraphRef = useRef<{ ctx: AudioContext; source: MediaElementAudioSourceNode; dest: MediaStreamAudioDestinationNode } | null>(null)
   const [message, setMessage] = useReducerString()
@@ -74,32 +72,30 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   /* ── Import & audio decode ─────────────────────────────────────────────── */
 
   const importVideo = useCallback((file: File) => {
-    const video = videoRef.current
-    if (!video) return
-    if (srcUrlRef.current) URL.revokeObjectURL(srcUrlRef.current)
     const url = URL.createObjectURL(file)
-    srcUrlRef.current = url
-    pendingImportRef.current = { fileName: file.name }
-    video.src = url
-  }, [])
+    const id = `vid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+    // Probe element: several imports can be in flight at once, so metadata is
+    // read off a scratch <video> instead of the single playback element.
+    const probe = document.createElement('video')
+    probe.preload = 'metadata'
+    probe.onloadedmetadata = () => {
+      const durationMs = Number.isFinite(probe.duration) ? probe.duration * 1000 : 0
+      // Adds the source rather than replacing it — the timeline grows with imports.
+      dispatch({ type: 'VIDEO_ADDED', id, fileName: file.name, videoUrl: url, durationMs })
+      void extractAudio(url, id)
+      probe.removeAttribute('src') // done probing; the playback element takes over
+    }
+    probe.onerror = () => {
+      URL.revokeObjectURL(url)
+      setMessage(`Could not read video: ${file.name}`)
+    }
+    probe.src = url
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setMessage])
 
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
-
-    const onLoadedMetadata = () => {
-      const pending = pendingImportRef.current
-      const mediaUrl = srcUrlRef.current
-      if (!pending || !mediaUrl) return
-      const durationMs = Number.isFinite(video.duration) ? video.duration * 1000 : 0
-      dispatch({
-        type: 'MEDIA_IMPORTED',
-        fileName: pending.fileName,
-        videoUrl: mediaUrl,
-        durationMs,
-      })
-      void extractAudio(mediaUrl)
-    }
     const onEnded = () => {
       // Reset playhead and video position when playback finishes
       dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: 0 })
@@ -108,26 +104,28 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         dispatch({ type: 'PLAYBACK_SET', playing: false })
       }
     }
-
-    video.addEventListener('loadedmetadata', onLoadedMetadata)
     video.addEventListener('ended', onEnded)
-    // Reset playback position so the user can replay the video immediately
-    video.currentTime = 0
     return () => {
-      video.removeEventListener('loadedmetadata', onLoadedMetadata)
       video.removeEventListener('ended', onEnded)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  async function extractAudio(explicitUrl?: string): Promise<void> {
-    const seq = ++analysisSeqRef.current
+  /** The playback element always mirrors the active source (import/switch). */
+  useEffect(() => {
+    const video = videoRef.current
+    const url = state.project?.videoUrl
+    if (!video || !url || video.src === url) return
+    video.pause()
+    video.src = url
+    video.currentTime = 0
+  }, [state.project?.videoUrl])
+
+  /** Decode a specific import's audio track; the reducer attaches it by id. */
+  async function extractAudio(url: string, videoId: string): Promise<void> {
     try {
       dispatch({ type: 'ANALYSIS_PROGRESS', ratio: 0.25 })
       const audioCtx = new AudioContext()
-      const fileUrl = explicitUrl ?? srcUrlRef.current ?? stateRef.current.project?.videoUrl
-      if (!fileUrl) throw new Error('no media url')
-      const res = await fetch(fileUrl)
+      const res = await fetch(url)
       const arrayBuffer = await res.arrayBuffer()
       dispatch({ type: 'ANALYSIS_PROGRESS', ratio: 0.5 })
 
@@ -135,22 +133,20 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         // decode with success|error callback form for maximum browser support
         void audioCtx.decodeAudioData(arrayBuffer, resolve, (err) => reject(err instanceof Error ? err : new Error('decode failed')))
       })
-      if (seq !== analysisSeqRef.current) return // superseded by another import
 
       const mix = mixdownToMono(buffer as unknown as AudioBufferLike)
       dispatch({ type: 'ANALYSIS_PROGRESS', ratio: 1 })
       dispatch({
         type: 'ANALYSIS_DONE',
+        videoId,
         samples: mix.samples,
         sampleRate: mix.sampleRate,
         durationMs: mix.durationMs,
       })
       void audioCtx.close()
     } catch (err) {
-      if (seq === analysisSeqRef.current) {
-        console.error(err)
-        setMessage(`Audio analysis failed: ${err instanceof Error ? err.message : 'unknown error'}`)
-      }
+      console.error(err)
+      setMessage(`Audio analysis failed: ${err instanceof Error ? err.message : 'unknown error'}`)
     }
   }
 
@@ -174,6 +170,11 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
   const setFitMode = useCallback((mode: FitMode) => {
     dispatch({ type: 'FIT_MODE_SET', fitMode: mode })
+  }, [])
+
+  /** Switch the active editing source among the imported videos. */
+  const selectVideo = useCallback((id: string) => {
+    dispatch({ type: 'VIDEO_SELECTED', id })
   }, [])
 
   const autoZoom = useCallback(() => dispatch({ type: 'AUTO_ZOOM' }), [])
@@ -388,10 +389,21 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       })
       dispatch({ type: 'EXPORT_PHASE_SET', phase: null, detail: '' })
 
+      const filename = exportFileName(s.project.fileName.replace(/\.[^.]+$/, ''))
+      const outcome = await saveMp4Blob(blob, filename)
+      if (outcome === 'saved') {
+        setMessage('Export complete — MP4 saved.')
+        return
+      }
+      if (outcome === 'cancelled') {
+        setMessage('Export cancelled.')
+        return
+      }
+      // No save dialog in this browser: fall back to a plain download.
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = exportFileName(s.project.fileName.replace(/\.[^.]+$/, ''))
+      a.download = filename
       a.click()
       URL.revokeObjectURL(url)
       setMessage('Export complete — MP4 saved.')
@@ -512,11 +524,12 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       saveProject,
       fetchProjectList,
       applySavedProject,
+      selectVideo,
       registerCanvas,
       message,
       deleteClip,
     }),
-    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
+    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
   )
 
   return (
@@ -539,6 +552,31 @@ function once(target: EventTarget, event: string): Promise<void> {
   return new Promise((resolve) => {
     target.addEventListener(event, () => resolve(), { once: true })
   })
+}
+
+type SaveBlobOutcome = 'saved' | 'cancelled' | 'unavailable'
+
+/**
+ * Offer the user a native save-location dialog via the File System Access API
+ * (Chromium-family). 'cancelled' is returned when the user backs out of the
+ * dialog; 'unavailable' means the caller should fall back to a plain download.
+ */
+async function saveMp4Blob(blob: Blob, filename: string): Promise<SaveBlobOutcome> {
+  if (typeof window.showSaveFilePicker !== 'function') return 'unavailable'
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: filename,
+      types: [{ description: 'MP4 Video', accept: { 'video/mp4': ['.mp4'] } }],
+    })
+    const writable = await handle.createWritable()
+    await writable.write(blob)
+    await writable.close()
+    return 'saved'
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') return 'cancelled'
+    console.error(err)
+    return 'unavailable'
+  }
 }
 
 /** Plain useReducer string setter — avoids one more state hook API. */

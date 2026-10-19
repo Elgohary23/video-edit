@@ -34,6 +34,16 @@ export interface MediaInfo {
   mixdown: { samples: Float32Array; sampleRate: number; durationMs: number } | null
 }
 
+/** One imported video. Several can coexist; the active one owns the timeline. */
+export interface VideoSource {
+  id: string
+  fileName: string
+  videoUrl: string
+  durationMs: number
+  /** Set once audio analysis completes for this source. */
+  mixdown: { samples: Float32Array; sampleRate: number; durationMs: number } | null
+}
+
 export interface ExportStatus {
   phase: 'recording' | 'transcoding' | null
   detail: string
@@ -44,6 +54,9 @@ export type Rotation = 0 | 90 | 180 | 270
 
 export interface EditorState {
   project: MediaInfo | null
+  /** Every imported video; switching resets the cut state via VIDEO_SELECTED. */
+  videos: VideoSource[]
+  activeVideoId: string | null
   analysisProgress: number // 0..1
   silenceConfig: SilenceConfig
   cutPlan: CutPlan | null
@@ -59,11 +72,19 @@ export interface EditorState {
 }
 
 export type EditorAction =
-  | { type: 'MEDIA_IMPORTED'; fileName: string; videoUrl: string; durationMs: number }
+  | { type: 'VIDEO_ADDED'; id: string; fileName: string; videoUrl: string; durationMs: number }
+  | { type: 'VIDEO_SELECTED'; id: string }
   | { type: 'MEDIA_FAILED' }
   | { type: 'ROTATION_SET'; rotation: Rotation }
   | { type: 'ANALYSIS_PROGRESS'; ratio: number }
-  | { type: 'ANALYSIS_DONE'; samples: Float32Array; sampleRate: number; durationMs: number }
+  | {
+      type: 'ANALYSIS_DONE'
+      /** Which source the decoded audio belongs to; without it, the active one. */
+      videoId?: string
+      samples: Float32Array
+      sampleRate: number
+      durationMs: number
+    }
   | { type: 'SILENCE_CONFIG_SET'; config: Partial<SilenceConfig> }
   | { type: 'CUT_APPLIED'; cutPlan: CutPlan }
   | { type: 'RESET_CUTS' }
@@ -94,6 +115,8 @@ export type EditorAction =
 
 export const initialEditorState: EditorState = {
   project: null,
+  videos: [],
+  activeVideoId: null,
   analysisProgress: 0,
   silenceConfig: { ...DEFAULT_SILENCE_CONFIG },
   cutPlan: null,
@@ -113,11 +136,41 @@ const MIN_PROP_RANGE_MS = 50
 
 export function editorReducer(state: EditorState, action: EditorAction): EditorState {
   switch (action.type) {
-    case 'MEDIA_IMPORTED':
+    case 'VIDEO_ADDED': {
+      const video: VideoSource = {
+        id: action.id,
+        fileName: action.fileName,
+        videoUrl: action.videoUrl,
+        durationMs: action.durationMs,
+        mixdown: null,
+      }
+      // Fresh import of this source: same fresh-edit reset as before plus the
+      // source joining (not replacing) the created videos list.
       return {
         ...initialEditorState,
-        project: { fileName: action.fileName, videoUrl: action.videoUrl, durationMs: action.durationMs, mixdown: null },
+        videos: [...state.videos, video],
+        activeVideoId: video.id,
+        project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, mixdown: null },
       }
+    }
+
+    case 'VIDEO_SELECTED': {
+      const video = state.videos.find((v) => v.id === action.id)
+      if (!video) return state
+      // Switching sources invalidates cuts and props (they belong to the
+      // previous media); user prefs (blur, fit, rotation) carry over.
+      return {
+        ...state,
+        activeVideoId: video.id,
+        project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, mixdown: video.mixdown },
+        clips: [],
+        cutPlan: null,
+        props: [],
+        selectedPropId: null,
+        playing: false,
+        playheadMs: 0,
+      }
+    }
 
     case 'MEDIA_FAILED':
       return { ...state, project: null, playing: false }
@@ -125,13 +178,16 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     case 'ANALYSIS_PROGRESS':
       return { ...state, analysisProgress: clamp(action.ratio, 0, 1) }
 
-    case 'ANALYSIS_DONE':
+    case 'ANALYSIS_DONE': {
+      const mixdown = { samples: action.samples, sampleRate: action.sampleRate, durationMs: action.durationMs }
+      const belongs = (id: string | null) => (action.videoId === undefined ? id === state.activeVideoId : id === action.videoId)
+      const videos = state.videos.map((v) => (belongs(v.id) ? { ...v, mixdown } : v))
       return {
         ...state,
-        project: state.project
-          ? { ...state.project, mixdown: { samples: action.samples, sampleRate: action.sampleRate, durationMs: action.durationMs } }
-          : null,
+        videos,
+        project: state.project && belongs(state.activeVideoId) ? { ...state.project, mixdown } : state.project,
       }
+    }
 
     case 'SILENCE_CONFIG_SET':
       // changing parameters invalidates the last plan

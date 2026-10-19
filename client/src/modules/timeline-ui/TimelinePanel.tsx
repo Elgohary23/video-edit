@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { useEditor } from '../../app/state/EditorProvider'
+import type { VideoSource } from '../../app/state/editor'
 import { computePeaks } from '../audio-analysis/engine'
 import { timelineDurationMs, timelineStartOfClip } from '../timeline/engine'
 import { clamp } from '../shared/utils'
 import { ClipDeleteButton } from './ClipDeleteButton'
 
 const WAVE_HEIGHT = 72
+const ZOOM_MAX = 4
+const ZOOM_STEP = 0.5
 
 interface LaneDrag {
   kind: 'clip-start' | 'clip-end' | 'prop-start' | 'prop-end'
@@ -21,11 +24,15 @@ interface LaneDrag {
  * shared playhead. Pointer interactions map directly to reducer actions.
  */
 export function TimelinePanel() {
-  const { state, seek, splitClipAt, trimClipBy, setPropRange, selectProp } = useEditor()
+  const { state, seek, splitClipAt, trimClipBy, setPropRange, selectProp, selectVideo } = useEditor()
 
   const waveRef = useRef<HTMLCanvasElement>(null)
   const totalMs = timelineDurationMs(state.clips)
   const dragRef = useRef<LaneDrag | null>(null)
+
+  /* ── timeline zoom (1x native, up to 4x, scrollable) ──────────────────── */
+
+  const [zoom, setZoom] = useState(1)
 
   /* ── waveform rendering ───────────────────────────────────────────────── */
 
@@ -77,7 +84,7 @@ export function TimelinePanel() {
       ctx.fillStyle = '#27272a'
       for (let x = 0; x < w; x += 6) ctx.fillRect(x, h / 2 - 1, 3, 2)
     }
-  }, [peaks, state.cutPlan, state.project])
+  }, [peaks, state.cutPlan, state.project, zoom])
 
   /* ── seeking on the waveform ──────────────────────────────────────────── */
 
@@ -153,12 +160,6 @@ export function TimelinePanel() {
             ) : null}
           </div>
           <div className="flex items-center gap-3 text-[10px]">
-            {state.cutPlan !== null && (
-              <span className="flex items-center gap-1 text-zinc-400">
-                <span className="inline-block size-2 rounded-xs bg-red-500/50" />
-                Red zones = Removed silence
-              </span>
-            )}
             <span className="tabular-nums text-zinc-400">
               {state.clips.length} clip{state.clips.length === 1 ? '' : 's'} · {state.props.length} prop
               {state.props.length === 1 ? '' : 's'}
@@ -166,122 +167,257 @@ export function TimelinePanel() {
           </div>
         </div>
 
-        <div className="relative space-y-2" data-all-lanes>
-          <canvas
-            ref={waveRef}
-            width={1200}
-            height={WAVE_HEIGHT}
-            onPointerDown={onWavePointer}
-            onPointerMove={(e) => {
-              if (e.buttons === 1) onWavePointer(e)
-            }}
-            className={`w-full rounded-lg ${empty ? 'cursor-default' : 'cursor-pointer'}`}
-            style={{ height: WAVE_HEIGHT }}
-            aria-label="Audio waveform"
-          />
+        {/* zoom controls — lanes below widen with the factor and scroll horizontally */}
+        {hasMedia && (
+          <div className="flex items-center justify-end gap-1.5">
+            <button
+              type="button"
+              aria-label="Zoom out timeline"
+              onClick={() => setZoom((z) => Math.max(1, z - ZOOM_STEP))}
+              disabled={zoom <= 1}
+              className="rounded border border-line px-2 py-0.5 text-[11px] text-zinc-300 transition-colors hover:bg-zinc-800/70 disabled:opacity-40"
+            >
+              −
+            </button>
+            <span className="w-9 text-center text-[10px] tabular-nums text-zinc-400">{zoom.toFixed(1)}x</span>
+            <button
+              type="button"
+              aria-label="Zoom in timeline"
+              onClick={() => setZoom((z) => Math.min(ZOOM_MAX, z + ZOOM_STEP))}
+              disabled={zoom >= ZOOM_MAX}
+              className="rounded border border-line px-2 py-0.5 text-[11px] text-zinc-300 transition-colors hover:bg-zinc-800/70 disabled:opacity-40"
+            >
+              +
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoom(1)}
+              disabled={zoom === 1}
+              className="rounded border border-line px-2 py-0.5 text-[11px] text-zinc-300 transition-colors hover:bg-zinc-800/70 disabled:opacity-40"
+            >
+              Reset
+            </button>
+          </div>
+        )}
 
-          {/* clip lane */}
-          <div className="relative h-9 overflow-hidden rounded-lg bg-zinc-900" data-lane>
-            {empty && (
-              <span className="absolute inset-0 grid place-items-center text-[11px] text-zinc-600">
-                {hasMedia ? 'Run "Apply silence cut" to build clips' : 'Import a video to begin'}
-              </span>
+        {/* one waveform "track" per imported source; click switches the edit target */}
+        {state.videos.length > 1 && (
+          <div className="space-y-1">
+            {state.videos.map((video) => (
+              <SourceRow
+                key={video.id}
+                video={video}
+                active={video.id === state.activeVideoId}
+                onSelect={() => selectVideo(video.id)}
+              />
+            ))}
+          </div>
+        )}
+
+        <div className="overflow-x-auto" style={{ maxHeight: 240 }}>
+          <div
+            className="relative space-y-2"
+            data-all-lanes
+            style={{ width: `${zoom * 100}%`, minWidth: '100%' }}
+          >
+            {state.cutPlan === null ? (
+              <canvas
+                ref={waveRef}
+                width={1200 * zoom}
+                height={WAVE_HEIGHT}
+                onPointerDown={onWavePointer}
+                onPointerMove={(e) => {
+                  if (e.buttons === 1) onWavePointer(e)
+                }}
+                className={`w-full rounded-lg ${empty ? 'cursor-default' : 'cursor-pointer'}`}
+                style={{ height: WAVE_HEIGHT }}
+                aria-label="Audio waveform"
+              />
+            ) : (
+              <div
+                role="img"
+                aria-label="Audio waveform hidden"
+                className="grid w-full place-items-center rounded-lg bg-zinc-900"
+                style={{ height: WAVE_HEIGHT }}
+              >
+                <span className="text-[11px] text-zinc-600">Waveform hidden — clips built from silence cut</span>
+              </div>
             )}
-            {state.clips.map((clip, i) => {
-              const startTL = timelineStartOfClip(state.clips, i)
-              const span = clip.srcEndMs - clip.srcStartMs
-              return (
+
+            {/* clip lane */}
+            <div className="relative h-9 overflow-hidden rounded-lg bg-zinc-900" data-lane>
+              {empty && (
+                <span className="absolute inset-0 grid place-items-center text-[11px] text-zinc-600">
+                  {hasMedia ? 'Run "Apply silence cut" to build clips' : 'Import a video to begin'}
+                </span>
+              )}
+              {state.clips.map((clip, i) => {
+                const startTL = timelineStartOfClip(state.clips, i)
+                const span = clip.srcEndMs - clip.srcStartMs
+                return (
+                  <div
+                    key={clip.id}
+                    className="group absolute inset-y-0 flex cursor-pointer items-center overflow-hidden rounded-md border border-zinc-700 bg-zinc-800/80 text-[10px] text-zinc-300 transition-colors hover:border-accent/70"
+                    style={{
+                      left: `${pct(startTL)}%`,
+                      width: `max(0.5%, ${pct(span)}%)`,
+                      background: clip.zoom > 1 ? 'rgba(139, 92, 246, 0.25)' : undefined,
+                    }}
+                    title={`${clip.id} (zoom ${Math.round(clip.zoom * 100)}% · double-click to split)`}
+                    onDoubleClick={() => splitClipAt(clip.id, state.playheadMs)}
+                    onClick={() => seek(startTL)}
+                  >
+                    <span className="truncate px-1.5">{clip.id}</span>
+                    <ClipDeleteButton clipId={clip.id} />
+                    <div
+                      role="separator"
+                      aria-label="Trim clip start"
+                      className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize bg-accent/40 hover:bg-accent"
+                      onPointerDown={(e) => startLaneDrag('clip-start', clip.id, e)}
+                      onPointerMove={onLanePointerMove}
+                      onPointerUp={endLaneDrag}
+                      onPointerCancel={endLaneDrag}
+                    />
+                    <div
+                      role="separator"
+                      aria-label="Trim clip end"
+                      className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize bg-accent/40 hover:bg-accent"
+                      onPointerDown={(e) => startLaneDrag('clip-end', clip.id, e)}
+                      onPointerMove={onLanePointerMove}
+                      onPointerUp={endLaneDrag}
+                      onPointerCancel={endLaneDrag}
+                    />
+                  </div>
+                )
+              })}
+            </div>
+
+            {/* prop lane */}
+            <div className="relative h-7 overflow-hidden rounded-lg bg-zinc-900" data-lane>
+              {state.props.length === 0 && (
+                <span className="absolute inset-0 grid place-items-center text-[11px] text-zinc-600">Props overlay track</span>
+              )}
+              {state.props.map((prop) => (
                 <div
-                  key={clip.id}
-                  className="group absolute inset-y-0 flex cursor-pointer items-center overflow-hidden rounded-md border border-zinc-700 bg-zinc-800/80 text-[10px] text-zinc-300 transition-colors hover:border-accent/70"
-                  style={{
-                    left: `${pct(startTL)}%`,
-                    width: `max(0.5%, ${pct(span)}%)`,
-                    background: clip.zoom > 1 ? 'rgba(139, 92, 246, 0.25)' : undefined,
+                  key={prop.id}
+                  role="button"
+                  tabIndex={0}
+                  className={`absolute inset-y-0 flex cursor-pointer items-center overflow-hidden rounded-md border px-1.5 text-[10px] ${
+                    state.selectedPropId === prop.id
+                      ? 'border-accent bg-accent/20 text-zinc-100'
+                      : 'border-zinc-700 bg-zinc-800/60 text-zinc-300'
+                  }`}
+                  style={{ left: `${pct(prop.range.startMs)}%`, width: `max(0.5%, ${pct(prop.range.endMs - prop.range.startMs)}%)` }}
+                  onClick={() => selectProp(prop.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') selectProp(prop.id)
                   }}
-                  title={`${clip.id} (zoom ${Math.round(clip.zoom * 100)}% · double-click to split)`}
-                  onDoubleClick={() => splitClipAt(clip.id, state.playheadMs)}
-                  onClick={() => seek(startTL)}
                 >
-                  <span className="truncate px-1.5">{clip.id}</span>
-                  <ClipDeleteButton clipId={clip.id} />
+                  <span className="truncate">{prop.name}</span>
                   <div
                     role="separator"
-                    aria-label="Trim clip start"
-                    className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize bg-accent/40 hover:bg-accent"
-                    onPointerDown={(e) => startLaneDrag('clip-start', clip.id, e)}
+                    aria-label="Prop in-point"
+                    className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize bg-emerald-400/40 hover:bg-emerald-400"
+                    onPointerDown={(e) => startLaneDrag('prop-start', prop.id, e)}
                     onPointerMove={onLanePointerMove}
                     onPointerUp={endLaneDrag}
                     onPointerCancel={endLaneDrag}
                   />
                   <div
                     role="separator"
-                    aria-label="Trim clip end"
-                    className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize bg-accent/40 hover:bg-accent"
-                    onPointerDown={(e) => startLaneDrag('clip-end', clip.id, e)}
+                    aria-label="Prop out-point"
+                    className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize bg-emerald-400/40 hover:bg-emerald-400"
+                    onPointerDown={(e) => startLaneDrag('prop-end', prop.id, e)}
                     onPointerMove={onLanePointerMove}
                     onPointerUp={endLaneDrag}
                     onPointerCancel={endLaneDrag}
                   />
                 </div>
-              )
-            })}
-          </div>
+              ))}
+            </div>
 
-          {/* prop lane */}
-          <div className="relative h-7 overflow-hidden rounded-lg bg-zinc-900" data-lane>
-            {state.props.length === 0 && (
-              <span className="absolute inset-0 grid place-items-center text-[11px] text-zinc-600">Props overlay track</span>
-            )}
-            {state.props.map((prop) => (
+            {/* playhead spanning waveform + lanes */}
+            {!empty && (
               <div
-                key={prop.id}
-                role="button"
-                tabIndex={0}
-                className={`absolute inset-y-0 flex cursor-pointer items-center overflow-hidden rounded-md border px-1.5 text-[10px] ${
-                  state.selectedPropId === prop.id
-                    ? 'border-accent bg-accent/20 text-zinc-100'
-                    : 'border-zinc-700 bg-zinc-800/60 text-zinc-300'
-                }`}
-                style={{ left: `${pct(prop.range.startMs)}%`, width: `max(0.5%, ${pct(prop.range.endMs - prop.range.startMs)}%)` }}
-                onClick={() => selectProp(prop.id)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') selectProp(prop.id)
-                }}
-              >
-                <span className="truncate">{prop.name}</span>
-                <div
-                  role="separator"
-                  aria-label="Prop in-point"
-                  className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize bg-emerald-400/40 hover:bg-emerald-400"
-                  onPointerDown={(e) => startLaneDrag('prop-start', prop.id, e)}
-                  onPointerMove={onLanePointerMove}
-                  onPointerUp={endLaneDrag}
-                  onPointerCancel={endLaneDrag}
-                />
-                <div
-                  role="separator"
-                  aria-label="Prop out-point"
-                  className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize bg-emerald-400/40 hover:bg-emerald-400"
-                  onPointerDown={(e) => startLaneDrag('prop-end', prop.id, e)}
-                  onPointerMove={onLanePointerMove}
-                  onPointerUp={endLaneDrag}
-                  onPointerCancel={endLaneDrag}
-                />
-              </div>
-            ))}
+                aria-hidden
+                className="pointer-events-none absolute inset-y-0 w-px bg-accent"
+                style={{ left: `${clamp(pct(state.playheadMs), 0, 100)}%` }}
+              />
+            )}
           </div>
-
-          {/* playhead spanning waveform + lanes */}
-          {!empty && (
-            <div
-              aria-hidden
-              className="pointer-events-none absolute inset-y-0 w-px bg-accent"
-              style={{ left: `${clamp(pct(state.playheadMs), 0, 100)}%` }}
-            />
-          )}
         </div>
       </div>
     </section>
+  )
+}
+
+interface SourceRowProps {
+  video: VideoSource
+  active: boolean
+  onSelect: () => void
+}
+
+/**
+ * One imported video as a compact waveform "track" row. Clicking switches the
+ * active editing source (VIDEO_SELECTED); the active row is marked by the
+ * accent dot and lighter peaks.
+ */
+function SourceRow({ video, active, onSelect }: SourceRowProps) {
+  const waveRef = useRef<HTMLCanvasElement>(null)
+
+  useEffect(() => {
+    const canvas = waveRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const w = canvas.width
+    const h = canvas.height
+    ctx.clearRect(0, 0, w, h)
+    ctx.fillStyle = '#18181b'
+    ctx.fillRect(0, 0, w, h)
+
+    const mixdown = video.mixdown
+    if (!mixdown) {
+      // dotted placeholder while this source is still decoding
+      ctx.fillStyle = '#27272a'
+      for (let x = 0; x < w; x += 6) ctx.fillRect(x, h / 2 - 1, 3, 2)
+      return
+    }
+    const peaks = computePeaks(mixdown.samples, 1200)
+    const peakW = w / peaks.length
+    const mid = h / 2
+    ctx.fillStyle = active ? '#52525b' : '#3f3f46'
+    for (let i = 0; i < peaks.length; i++) {
+      const p = peaks[i]
+      ctx.fillRect(i * peakW, mid + p.min * mid * 0.9, peakW, Math.max(1, (p.max - p.min) * mid * 0.9))
+    }
+  }, [video.mixdown, active])
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`flex h-10 w-full items-center gap-2 rounded-lg border px-2 py-1 text-left transition-colors ${
+        active ? 'border-accent/60 bg-zinc-900' : 'border-line hover:border-zinc-600'
+      }`}
+      title={active ? `${video.fileName} (editing)` : `Switch to ${video.fileName}`}
+    >
+      <span aria-hidden className={`size-1.5 shrink-0 rounded-full ${active ? 'bg-accent' : 'bg-zinc-600'}`} />
+      <span className="w-28 shrink-0 truncate text-[10px] text-zinc-400">{video.fileName}</span>
+      <canvas
+        ref={waveRef}
+        width={1200}
+        height={28}
+        className="h-6 min-w-0 flex-1 rounded"
+        style={{ height: 24 }}
+        aria-label={`${active ? 'Editing' : 'Imported'} source ${video.fileName}`}
+      />
+      <span className="flex shrink-0 items-center gap-1.5 text-[10px] tabular-nums text-zinc-500">
+        {video.mixdown === null && <span className="font-medium text-amber-400">analyzing…</span>}
+        {Math.round(video.durationMs / 100) / 10}s
+      </span>
+      {!active && <span className="shrink-0 text-[9px] uppercase tracking-wider text-zinc-600">switch</span>}
+    </button>
   )
 }

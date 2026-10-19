@@ -3,7 +3,8 @@ import { editorReducer, initialEditorState, type EditorState } from './editor'
 
 function stateWithClip(): EditorState {
   const base = editorReducer(initialEditorState, {
-    type: 'MEDIA_IMPORTED',
+    type: 'VIDEO_ADDED',
+    id: 'vid-1',
     fileName: 'take.mp4',
     videoUrl: 'blob:x',
     durationMs: 3000,
@@ -21,20 +22,61 @@ function stateWithClip(): EditorState {
 }
 
 describe('media actions', () => {
-  it('import replaces state with fresh defaults + media info', () => {
+  it('import adds to the video list, becomes active, and resets the edit state', () => {
     const withClip = stateWithClip()
-    const next = editorReducer(withClip, { type: 'MEDIA_IMPORTED', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
+    const next = editorReducer(withClip, { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
     expect(next.clips).toEqual([])
     expect(next.props).toEqual([])
     expect(next.project?.fileName).toBe('b.mp4')
     expect(next.playing).toBe(false)
+    // multi-video: the new source joins the list and takes over
+    expect(next.videos).toHaveLength(2)
+    expect(next.videos[0]).toMatchObject({ id: 'vid-1', fileName: 'take.mp4' })
+    expect(next.activeVideoId).toBe('vid-2')
   })
-  it('analysis progress clamps and done fills mixdown', () => {
+
+  it('selecting an imported video makes it active, restores its mixdown, resets edits', () => {
+    const twoVideos = stateWithClip()
+    const second = editorReducer(twoVideos, { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
+    const analyzed = editorReducer(second, {
+      type: 'ANALYSIS_DONE',
+      videoId: 'vid-1',
+      samples: new Float32Array([0.2]),
+      sampleRate: 1000,
+      durationMs: 1,
+    })
+    const back = editorReducer(analyzed, { type: 'VIDEO_SELECTED', id: 'vid-1' })
+    expect(back.activeVideoId).toBe('vid-1')
+    expect(back.project?.fileName).toBe('take.mp4')
+    expect(back.project?.mixdown?.sampleRate).toBe(1000) // vid-1's analysis follows it
+    expect(back.videos).toHaveLength(2) // the other source stays in the list
+    expect(back.clips).toEqual([]) // vid-2's edits don't leak
+    expect(back.cutPlan).toBeNull()
+    expect(editorReducer(analyzed, { type: 'VIDEO_SELECTED', id: 'nope' })).toBe(analyzed)
+  })
+
+  it('analysis progress clamps and done fills mixdown of the named source', () => {
     const base = stateWithClip()
     const tooMuch = editorReducer(base, { type: 'ANALYSIS_PROGRESS', ratio: 5 })
     expect(tooMuch.analysisProgress).toBe(1)
     const done = editorReducer(base, { type: 'ANALYSIS_DONE', samples: new Float32Array([0, 0.5]), sampleRate: 1000, durationMs: 2 })
     expect(done.project?.mixdown?.sampleRate).toBe(1000)
+    expect(done.videos[0].mixdown?.sampleRate).toBe(1000)
+  })
+
+  it('analysis done for a non-active video updates that video only', () => {
+    const base = stateWithClip()
+    const other = editorReducer(base, { type: 'VIDEO_ADDED', id: 'vid-2', fileName: 'b.mp4', videoUrl: 'blob:y', durationMs: 10 })
+    const next = editorReducer(other, {
+      type: 'ANALYSIS_DONE',
+      videoId: 'vid-1',
+      samples: new Float32Array([1]),
+      sampleRate: 2000,
+      durationMs: 2,
+    })
+    expect(next.videos.find((v) => v.id === 'vid-1')?.mixdown?.sampleRate).toBe(2000)
+    expect(next.videos.find((v) => v.id === 'vid-2')?.mixdown).toBeNull()
+    expect(next.project?.mixdown).toBeNull() // vid-2 stays the active edit target
   })
 })
 
