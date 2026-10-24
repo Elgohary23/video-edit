@@ -96,8 +96,14 @@ function stubCtx(canvasW = 640, canvasH = 360) {
   const ctx = {
     clearRect: vi.fn((...args: unknown[]) => calls.push(`clear:${args.join(',')}`)),
     drawImage: vi.fn((...args: unknown[]) => calls.push(`draw:${args.join(',')}`)),
+    fillRect: vi.fn((...args: unknown[]) => calls.push(`fill:${args.join(',')}`)),
+    save: vi.fn(() => calls.push('save')),
+    restore: vi.fn(() => calls.push('restore')),
+    translate: vi.fn((...args: unknown[]) => calls.push(`translate:${args.join(',')}`)),
+    rotate: vi.fn((...args: unknown[]) => calls.push(`rotate:${args.join(',')}`)),
     filter: 'none',
     globalAlpha: 1,
+    fillStyle: '#000',
     canvas: { width: canvasW, height: canvasH },
   }
   return { ctx: ctx as unknown as CanvasRenderingContext2D, calls, raw: ctx }
@@ -167,5 +173,120 @@ describe('drawFrame', () => {
     // Should contain inside 640x360: height is 360, width is 360 * (720/1280) = 202.5, dx = (640 - 202.5)/2 = 218.75
     const drawMain = calls.find((c) => c.startsWith('draw:v-portrait,0,0,720,1280,218.75,0,202.5,360'))
     expect(drawMain).toBeDefined()
+  })
+
+  it('holds the previous frame instead of clearing while a source is undecodable', () => {
+    const { ctx, calls, raw } = stubCtx()
+    const video = { el: 'v' as unknown as CanvasImageSource, width: 1000, height: 1000, ready: false }
+    const settings: CompositorSettings = {
+      clips: [clip],
+      playheadMs: 500,
+      blurEnabled: false,
+      blurPx: 0,
+      video,
+      activeProps: [],
+      holdLastFrame: true,
+    }
+    drawFrame(ctx, 640, 360, settings)
+    expect(raw.clearRect).not.toHaveBeenCalled()
+    expect(calls).toEqual([])
+  })
+
+  it('still renders a ready frame when holdLastFrame is set', () => {
+    const { ctx, raw } = stubCtx()
+    const video = { el: 'v' as unknown as CanvasImageSource, width: 1000, height: 1000, ready: true }
+    const settings: CompositorSettings = {
+      clips: [clip],
+      playheadMs: 500,
+      blurEnabled: false,
+      blurPx: 0,
+      video,
+      activeProps: [],
+      holdLastFrame: true,
+    }
+    drawFrame(ctx, 640, 360, settings)
+    expect(raw.clearRect).toHaveBeenCalledTimes(1)
+    expect(raw.drawImage).toHaveBeenCalled()
+  })
+
+  it('paints the small pre-blurred backdrop instead of the full blur fallback', () => {
+    const { ctx, calls } = stubCtx()
+    const video = { el: 'v-portrait' as unknown as CanvasImageSource, width: 720, height: 1280, ready: true }
+    const settings: CompositorSettings = {
+      clips: [clip],
+      playheadMs: 0,
+      blurEnabled: false,
+      blurPx: 0,
+      fitMode: 'contain',
+      video,
+      activeProps: [],
+      backdrop: 'backdrop' as unknown as CanvasImageSource,
+    }
+    drawFrame(ctx, 640, 360, settings)
+
+    const backdropIndex = calls.indexOf('draw:backdrop,0,0,640,360')
+    const videoIndex = calls.findIndex((call) => call.startsWith('draw:v-portrait'))
+    expect(backdropIndex).toBeGreaterThanOrEqual(0)
+    expect(videoIndex).toBeGreaterThan(backdropIndex)
+    // The expensive per-frame blur of the source is not used.
+    expect(calls.filter((call) => call.startsWith('draw:v-portrait'))).toHaveLength(1)
+    expect(calls.some((call) => call.startsWith('fill:'))).toBe(true)
+  })
+
+  it('leaves the letterbox transparent for alpha exports', () => {
+    const { ctx, calls } = stubCtx()
+    const video = { el: 'v-portrait' as unknown as CanvasImageSource, width: 720, height: 1280, ready: true }
+    const settings: CompositorSettings = {
+      clips: [clip],
+      playheadMs: 0,
+      blurEnabled: false,
+      blurPx: 0,
+      fitMode: 'contain',
+      video,
+      activeProps: [],
+      backdrop: 'backdrop' as unknown as CanvasImageSource,
+      preserveAlpha: true,
+    }
+    drawFrame(ctx, 640, 360, settings)
+    expect(calls.some((call) => call.startsWith('draw:backdrop'))).toBe(false)
+    expect(calls.some((call) => call.startsWith('fill:'))).toBe(false)
+    expect(calls.filter((call) => call.startsWith('draw:v-portrait'))).toHaveLength(1)
+  })
+
+  it('falls back to a blurred full-frame backdrop when no backdrop was supplied', () => {
+    const { ctx, calls, raw } = stubCtx()
+    const video = { el: 'v-portrait' as unknown as CanvasImageSource, width: 720, height: 1280, ready: true }
+    const settings: CompositorSettings = {
+      clips: [clip],
+      playheadMs: 0,
+      blurEnabled: false,
+      blurPx: 0,
+      fitMode: 'contain',
+      video,
+      activeProps: [],
+    }
+    drawFrame(ctx, 640, 360, settings)
+    expect(calls.filter((call) => call.startsWith('draw:v-portrait'))).toHaveLength(2)
+    expect(raw.filter).toBe('none')
+  })
+
+  it('balances save/restore when rotating so exports do not accumulate transforms', () => {
+    const { ctx, calls } = stubCtx()
+    const video = { el: 'v' as unknown as CanvasImageSource, width: 1000, height: 1000, ready: true }
+    const settings: CompositorSettings = {
+      clips: [clip],
+      playheadMs: 0,
+      blurEnabled: false,
+      blurPx: 0,
+      rotation: 90,
+      video,
+      activeProps: [],
+    }
+    drawFrame(ctx, 640, 360, settings)
+    expect(calls[0]).toBe('clear:0,0,640,360')
+    expect(calls[1]).toBe('save')
+    expect(calls.at(-1)).toBe('restore')
+    expect(calls.filter((call) => call === 'save')).toHaveLength(1)
+    expect(calls.filter((call) => call === 'restore')).toHaveLength(1)
   })
 })

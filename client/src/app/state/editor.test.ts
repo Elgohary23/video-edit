@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { clipSourceId, clipVideoSource, clipsOfSource, editorReducer, initialEditorState, type EditorState } from './editor'
+import {
+  DEFAULT_IMAGE_DURATION_MS,
+  MAX_IMAGE_DURATION_MS,
+  MIN_IMAGE_DURATION_MS,
+  clipSourceId,
+  clipVideoSource,
+  clipsOfSource,
+  editorReducer,
+  initialEditorState,
+  normalizeImageDuration,
+  type EditorState,
+} from './editor'
 import { timelineStartOfClip } from '../../modules/timeline/engine'
 
 function stateWithClip(): EditorState {
@@ -348,5 +359,107 @@ describe('export settings + dialog state', () => {
     })
     const closed = editorReducer(done, { type: 'EXPORT_DIALOG_SET', open: false })
     expect(closed.exportDialogOpen).toBe(false)
+  })
+})
+
+function addImage(state: EditorState, id = 'img-1', durationMs = 3000): EditorState {
+  return editorReducer(state, {
+    type: 'VIDEO_ADDED',
+    id,
+    fileName: `${id}.png`,
+    videoUrl: `blob:${id}`,
+    durationMs,
+    kind: 'image',
+  })
+}
+
+describe('image timeline media', () => {
+  it('adds an image as a full-length clip and marks the project as an image', () => {
+    const next = addImage(initialEditorState, 'img-1', 4500)
+    expect(next.videos).toHaveLength(1)
+    expect(next.videos[0]).toMatchObject({ id: 'img-1', kind: 'image', durationMs: 4500, mixdown: null })
+    expect(next.clips).toHaveLength(1)
+    expect(next.clips[0]).toMatchObject({ videoId: 'img-1', srcStartMs: 0, srcEndMs: 4500, zoom: 1 })
+    expect(next.project).toMatchObject({ fileName: 'img-1.png', durationMs: 4500, kind: 'image' })
+    expect(next.activeVideoId).toBe('img-1')
+  })
+
+  it('falls back to the configured default when an image reports no duration', () => {
+    const next = addImage(initialEditorState, 'img-1', 0)
+    expect(next.videos[0].durationMs).toBe(DEFAULT_IMAGE_DURATION_MS)
+    expect(next.clips[0].srcEndMs).toBe(DEFAULT_IMAGE_DURATION_MS)
+  })
+
+  it('keeps video imports as video media', () => {
+    const next = editorReducer(initialEditorState, {
+      type: 'VIDEO_ADDED',
+      id: 'vid-1',
+      fileName: 'take.mp4',
+      videoUrl: 'blob:v',
+      durationMs: 2000,
+    })
+    expect(next.videos[0].kind).toBe('video')
+    expect(next.project?.kind).toBe('video')
+  })
+
+  it('normalizes the image duration into the supported range', () => {
+    expect(normalizeImageDuration(50)).toBe(MIN_IMAGE_DURATION_MS)
+    expect(normalizeImageDuration(20 * 60 * 1000)).toBe(MAX_IMAGE_DURATION_MS)
+    expect(normalizeImageDuration(Number.NaN)).toBe(DEFAULT_IMAGE_DURATION_MS)
+    expect(normalizeImageDuration(1234.6)).toBe(1235)
+  })
+
+  it('updates full-length image clips when the default duration changes', () => {
+    const imported = addImage(initialEditorState, 'img-1', 3000)
+    const next = editorReducer(imported, { type: 'IMAGE_DURATION_SET', assetId: 'img-1', durationMs: 5000 })
+    expect(next.videos[0].durationMs).toBe(5000)
+    expect(next.clips[0]).toMatchObject({ srcStartMs: 0, srcEndMs: 5000 })
+    expect(next.project?.durationMs).toBe(5000)
+  })
+
+  it('clamps manually split image clips to the new asset length', () => {
+    const imported = addImage(initialEditorState, 'img-1', 3000)
+    const split = editorReducer(imported, { type: 'CLIP_SPLIT', clipId: imported.clips[0].id, atMs: 1000 })
+    expect(split.clips).toHaveLength(2)
+    const next = editorReducer(split, { type: 'IMAGE_DURATION_SET', assetId: 'img-1', durationMs: 2000 })
+    expect(next.clips.map((clip) => [clip.srcStartMs, clip.srcEndMs])).toEqual([
+      [0, 1000],
+      [1000, 2000],
+    ])
+  })
+
+  it('keeps the playhead inside the timeline when an image shrinks', () => {
+    const imported = addImage(initialEditorState, 'img-1', 3000)
+    const parked = editorReducer(imported, { type: 'PLAYHEAD_SET', playheadMs: 2800 })
+    const shrunk = editorReducer(parked, { type: 'IMAGE_DURATION_SET', assetId: 'img-1', durationMs: 1000 })
+    expect(shrunk.clips[0].srcEndMs).toBe(1000)
+    expect(shrunk.playheadMs).toBe(1000)
+  })
+
+  it('does nothing for videos or unknown assets', () => {
+    const withVideo = editorReducer(initialEditorState, {
+      type: 'VIDEO_ADDED',
+      id: 'vid-1',
+      fileName: 'take.mp4',
+      videoUrl: 'blob:v',
+      durationMs: 2000,
+    })
+    expect(editorReducer(withVideo, { type: 'IMAGE_DURATION_SET', assetId: 'vid-1', durationMs: 5000 })).toBe(withVideo)
+    expect(editorReducer(withVideo, { type: 'IMAGE_DURATION_SET', assetId: 'ghost', durationMs: 5000 })).toBe(withVideo)
+  })
+
+  it('keeps earlier image clips when a video is imported afterwards', () => {
+    const withImage = addImage(initialEditorState, 'img-1', 3000)
+    const withVideo = editorReducer(withImage, {
+      type: 'VIDEO_ADDED',
+      id: 'vid-1',
+      fileName: 'take.mp4',
+      videoUrl: 'blob:v',
+      durationMs: 2000,
+    })
+    expect(withVideo.videos.map((video) => video.kind)).toEqual(['image', 'video'])
+    expect(withVideo.clips.map((clip) => clip.videoId)).toEqual(['img-1', 'vid-1'])
+    expect(withVideo.project?.kind).toBe('video')
+    expect(withVideo.clips[1]).toMatchObject({ srcStartMs: 0, srcEndMs: 2000 })
   })
 })

@@ -38,9 +38,37 @@ export function mixdownToMono(buffer: AudioBufferLike): Mixdown {
   return { samples, sampleRate, durationMs: (length / sampleRate) * 1000 }
 }
 
-/** Accept only media types the preview/export pipeline handles. */
+/** Media kinds the editor can place on the timeline. */
+export type MediaKind = 'video' | 'image'
+
+/** Accept only video types the preview/export pipeline handles. */
 export function isSupportedVideoType(type: string): boolean {
   return /^(video\/|application\/octet-stream$)/.test(type) && type !== 'video/x-msvideo'
+}
+
+/**
+ * Browsers report PNG as `image/png`; some OS drag sources omit the MIME type
+ * entirely, so the filename extension is the fallback. Only raster formats
+ * the canvas can decode are accepted (no SVG: it taints the export canvas).
+ */
+export function isSupportedImageType(type: string, name = ''): boolean {
+  if (/^image\/(png|jpe?g|webp|gif|avif|bmp)$/i.test(type)) return true
+  if (type !== '') return false
+  return /\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(name)
+}
+
+const VIDEO_EXTENSION = /\.(mp4|m4v|mov|webm|ogv|mkv|avi)$/i
+
+/**
+ * Classify an imported file as timeline media. Extension fallback only runs
+ * when the OS drag source omitted the MIME type (common on Windows), and
+ * images win because they are also valid `image/*` files.
+ */
+export function mediaKindOf(type: string, name = ''): MediaKind | null {
+  if (isSupportedImageType(type, name)) return 'image'
+  if (isSupportedVideoType(type)) return 'video'
+  if (type === '' && VIDEO_EXTENSION.test(name)) return 'video'
+  return null
 }
 
 export function describeVideo(name: string, durationMs: number): string {

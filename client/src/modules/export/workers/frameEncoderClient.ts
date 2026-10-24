@@ -5,8 +5,8 @@
  * UI thread responsive). Browsers without OffscreenCanvas/Worker fall back to
  * the exact same conversion on the main thread.
  */
-import type { FrameEncodeRequest, FrameEncodeResponse } from './frameEncoderProtocol'
-import { encodeCanvasToJpeg, type CanvasSource } from './canvasToJpeg'
+import type { FrameEncodeRequest, FrameEncodeResponse, FrameImageFormat } from './frameEncoderProtocol'
+import { encodeCanvasToImage, type CanvasSource } from './canvasToJpeg'
 
 export interface FrameEncoder {
   encode(source: CanvasSource, quality: number): Promise<Uint8Array>
@@ -14,8 +14,9 @@ export interface FrameEncoder {
 }
 
 class LocalFrameEncoder implements FrameEncoder {
+  constructor(private readonly format: FrameImageFormat) {}
   encode(source: CanvasSource, quality: number): Promise<Uint8Array> {
-    return encodeCanvasToJpeg(source, quality)
+    return encodeCanvasToImage(source, quality, this.format)
   }
   dispose(): void {}
 }
@@ -32,7 +33,7 @@ class WorkerFrameEncoder implements FrameEncoder {
   private disposed = false
   private failed = false
 
-  constructor() {
+  constructor(private readonly format: FrameImageFormat) {
     this.worker = new Worker(new URL('./frameEncoder.worker.ts', import.meta.url), { type: 'module' })
     this.worker.onmessage = (event: MessageEvent<FrameEncodeResponse>) => {
       const { id, buffer, error } = event.data
@@ -55,7 +56,7 @@ class WorkerFrameEncoder implements FrameEncoder {
 
   async encode(source: CanvasSource, quality: number): Promise<Uint8Array> {
     if (this.disposed || this.failed || typeof createImageBitmap !== 'function') {
-      return encodeCanvasToJpeg(source, quality)
+      return encodeCanvasToImage(source, quality, this.format)
     }
     let bitmap: ImageBitmap | null = null
     try {
@@ -63,14 +64,14 @@ class WorkerFrameEncoder implements FrameEncoder {
       const id = this.nextId++
       const bytes = await new Promise<Uint8Array>((resolve, reject) => {
         this.pending.set(id, { resolve, reject })
-        const request: FrameEncodeRequest = { id, bitmap: bitmap as ImageBitmap, quality }
+        const request: FrameEncodeRequest = { id, bitmap: bitmap as ImageBitmap, quality, format: this.format }
         this.worker.postMessage(request, [bitmap as ImageBitmap])
       })
       return bytes
     } catch {
       this.failed = true
       if (bitmap) bitmap.close()
-      return encodeCanvasToJpeg(source, quality)
+      return encodeCanvasToImage(source, quality, this.format)
     }
   }
 
@@ -91,13 +92,13 @@ function canUseWorker(): boolean {
   )
 }
 
-export function createFrameEncoder(): FrameEncoder {
+export function createFrameEncoder(format: FrameImageFormat = 'jpeg'): FrameEncoder {
   if (canUseWorker()) {
     try {
-      return new WorkerFrameEncoder()
+      return new WorkerFrameEncoder(format)
     } catch {
       // Worker construction can be blocked by CSP or older engines.
     }
   }
-  return new LocalFrameEncoder()
+  return new LocalFrameEncoder(format)
 }

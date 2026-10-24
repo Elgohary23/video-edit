@@ -7,7 +7,15 @@ import { ExportError } from '../utils/errors'
 
 const IMAGE_TIMEOUT_MS = 20_000
 
-export function loadPropImage(src: string, signal?: AbortSignal): Promise<HTMLImageElement> {
+/**
+ * Decode one image URL (props and image timeline assets share the same path).
+ * `label` only affects the actionable error copy.
+ */
+export function loadImageAsset(
+  src: string,
+  signal?: AbortSignal,
+  label = 'overlay image',
+): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image()
     let settled = false
@@ -29,8 +37,8 @@ export function loadPropImage(src: string, signal?: AbortSignal): Promise<HTMLIm
     const onError = () =>
       finish(() =>
         reject(
-          new ExportError('ASSET_LOAD_FAILED', `Could not load prop image ${src}`, {
-            userMessage: 'Could not load an overlay image for export. Re-import the image and try again.',
+          new ExportError('ASSET_LOAD_FAILED', `Could not load ${label} ${src}`, {
+            userMessage: 'Could not load an image for export. Re-import it and try again.',
           }),
         ),
       )
@@ -51,14 +59,18 @@ export function loadPropImage(src: string, signal?: AbortSignal): Promise<HTMLIm
     timer = window.setTimeout(() => {
       finish(() =>
         reject(
-          new ExportError('TIMEOUT', `Timed out loading prop image ${src}`, {
-            userMessage: 'Export timed out while loading an overlay image.',
+          new ExportError('TIMEOUT', `Timed out loading ${label} ${src}`, {
+            userMessage: 'Export timed out while loading an image.',
           }),
         ),
       )
     }, IMAGE_TIMEOUT_MS)
     image.src = src
   })
+}
+
+export function loadPropImage(src: string, signal?: AbortSignal): Promise<HTMLImageElement> {
+  return loadImageAsset(src, signal, 'overlay image')
 }
 
 export async function loadPropImages(

@@ -40,6 +40,19 @@ export interface CompositorSettings {
   video: VideoSource | null
   /** props visible at `playheadMs`, transforms pre-resolved */
   activeProps: PropFrame[]
+  /**
+   * Preview only: keep the previous canvas contents when the source video is
+   * momentarily undecodable (e.g. a seek across a cut). Without this, the
+   * clear-then-draw loop flashes black between adjacent clips.
+   */
+  holdLastFrame?: boolean
+  /** Pre-rendered low-res backdrop for contain/letterboxed sources. */
+  backdrop?: CanvasImageSource | null
+  /**
+   * Export-only: leave the letterbox area transparent instead of painting a
+   * (blurred) backdrop, preserving PNG alpha for VP9/WebM.
+   */
+  preserveAlpha?: boolean
 }
 
 export interface CropRect {
@@ -159,6 +172,13 @@ export type CompositorContext = CanvasRenderingContext2D | OffscreenCanvasRender
 
 /** Render one composited frame. Mutates only the passed context. */
 export function drawFrame(ctx: CompositorContext, canvasW: number, canvasH: number, settings: CompositorSettings): void {
+  const placed = settings.clips.length > 0 ? timelineToSource(settings.clips, settings.playheadMs) : null
+  const videoReady = settings.video?.ready === true
+
+  // Preview transport holds the last good frame while a clip-boundary seek is
+  // in flight. Clearing first would expose the black canvas between cuts.
+  if (!videoReady && placed && settings.holdLastFrame) return
+
   ctx.clearRect(0, 0, canvasW, canvasH)
 
   // Apply rotation if needed. `save`/`restore` must always balance or the
@@ -171,52 +191,59 @@ export function drawFrame(ctx: CompositorContext, canvasW: number, canvasH: numb
     ctx.translate(-canvasW / 2, -canvasH / 2)
   }
 
-  const videoReady = settings.video?.ready === true
-  if (videoReady && settings.clips.length > 0) {
-    const placed = timelineToSource(settings.clips, settings.playheadMs)
-    if (placed) {
-      const wasFiltered = shouldBlur(settings)
-      if (wasFiltered) {
-        ctx.filter = `blur(${settings.blurPx}px)`
-      }
+  if (videoReady && placed) {
+    const wasFiltered = shouldBlur(settings)
+    if (wasFiltered) {
+      ctx.filter = `blur(${settings.blurPx}px)`
+    }
 
-      if (settings.fitMode === 'contain') {
-        const c = computeContainRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
-        // If letterboxed or pillarboxed, render a soft blurred backdrop to avoid harsh black borders
-        if (c.dx > 0 || c.dy > 0) {
+    if (settings.fitMode === 'contain') {
+      const c = computeContainRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
+      // If letterboxed or pillarboxed, render a soft backdrop instead of
+      // harsh black borders. The caller supplies a tiny pre-blurred copy;
+      // the fallback keeps the old (expensive) path for other callers.
+      if ((c.dx > 0 || c.dy > 0) && !settings.preserveAlpha) {
+        if (settings.backdrop) {
+          ctx.drawImage(settings.backdrop, 0, 0, canvasW, canvasH)
+          const previousAlpha = ctx.globalAlpha
+          ctx.globalAlpha = 0.62
+          ctx.fillStyle = '#000'
+          ctx.fillRect(0, 0, canvasW, canvasH)
+          ctx.globalAlpha = previousAlpha
+        } else {
           ctx.filter = 'blur(20px) brightness(0.35)'
           ctx.drawImage(settings.video!.el, 0, 0, canvasW, canvasH)
           ctx.filter = wasFiltered ? `blur(${settings.blurPx}px)` : 'none'
         }
-        ctx.drawImage(
-          settings.video!.el,
-          c.sx,
-          c.sy,
-          c.sw,
-          c.sh,
-          c.dx,
-          c.dy,
-          c.dw,
-          c.dh,
-        )
-      } else {
-        const crop = computeCropRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
-        ctx.drawImage(
-          settings.video!.el,
-          crop.sx,
-          crop.sy,
-          crop.sw,
-          crop.sh,
-          0,
-          0,
-          canvasW,
-          canvasH,
-        )
       }
+      ctx.drawImage(
+        settings.video!.el,
+        c.sx,
+        c.sy,
+        c.sw,
+        c.sh,
+        c.dx,
+        c.dy,
+        c.dw,
+        c.dh,
+      )
+    } else {
+      const crop = computeCropRect(settings.video!.width, settings.video!.height, canvasW, canvasH, placed.clip.zoom)
+      ctx.drawImage(
+        settings.video!.el,
+        crop.sx,
+        crop.sy,
+        crop.sw,
+        crop.sh,
+        0,
+        0,
+        canvasW,
+        canvasH,
+      )
+    }
 
-      if (wasFiltered) {
-        ctx.filter = 'none'
-      }
+    if (wasFiltered) {
+      ctx.filter = 'none'
     }
   }
 

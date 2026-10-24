@@ -1,10 +1,14 @@
 /**
  * Streaming-style chunk encoder on top of FFmpeg's MEMFS.
  *
- * Frames are written one at a time, encoded into a standalone segment, read
- * back into a compact Uint8Array, and immediately deleted. Peak memory is
- * therefore bounded by one chunk of JPEG frames + the accumulated encoded
- * segments, not by the raw timeline.
+ * Frames are written one at a time, encoded into a standalone video-only
+ * segment, read back into a compact Uint8Array, and immediately deleted. Peak
+ * memory is therefore bounded by one chunk of frames + the accumulated
+ * encoded segments, not by the raw timeline.
+ *
+ * Audio is intentionally absent from the per-chunk pass: the caller mixes one
+ * continuous raw PCM track and `concat` muxes it exactly once, which avoids
+ * per-segment AAC/Opus priming drift.
  */
 import type { ExportSettings, SegmentEncoder } from '../types'
 import {
@@ -37,16 +41,35 @@ export interface FfmpegSessionLike {
   getLogs: () => string[]
 }
 
+/**
+ * Remove virtual files in bounded concurrent batches. Each deletion is a
+ * worker round-trip; awaiting hundreds of them one-by-one adds many seconds
+ * to a long export. Batching keeps memory/latency flat without flooding the
+ * worker with an unbounded message queue.
+ */
+async function deleteFiles(
+  session: FfmpegSessionLike,
+  names: readonly string[],
+  ledger: FileLedger,
+  batchSize = 32,
+): Promise<void> {
+  for (let index = 0; index < names.length; index += batchSize) {
+    const batch = names.slice(index, index + batchSize)
+    await Promise.all(batch.map((name) => session.deleteFile(name, ledger)))
+  }
+}
+
 export class FfmpegSegmentEncoder implements SegmentEncoder {
   private readonly ledger = new FileLedger()
 
   constructor(
     private readonly session: FfmpegSessionLike,
     private readonly settings: ExportSettings,
+    private readonly preserveAlpha = false,
   ) {}
 
   async writeFrame(chunkIndex: number, localFrameIndex: number, data: Uint8Array): Promise<void> {
-    const name = frameFileName(chunkIndex, localFrameIndex)
+    const name = frameFileName(chunkIndex, localFrameIndex, this.preserveAlpha ? 'png' : 'jpg')
     try {
       await this.session.writeFile(name, data, this.ledger)
     } catch (error) {
@@ -62,16 +85,9 @@ export class FfmpegSegmentEncoder implements SegmentEncoder {
   async encodeChunk(
     chunkIndex: number,
     frameCount: number,
-    audioWav: Uint8Array | null,
     signal: AbortSignal | undefined,
     onProgress: (ratio: number) => void,
   ): Promise<Uint8Array> {
-    const hasAudio = audioWav !== null
-    if (audioWav) {
-      // Multiple encode attempts must each get an owned buffer: writeFile
-      // transfers the underlying ArrayBuffer into FFmpeg's worker.
-      await this.session.writeFile(audioFileName(chunkIndex), new Uint8Array(audioWav), this.ledger)
-    }
     const output = segmentFileName(chunkIndex, this.settings)
     // Track the output before exec so a partially written file is cleaned up.
     this.ledger.track(output)
@@ -79,9 +95,8 @@ export class FfmpegSegmentEncoder implements SegmentEncoder {
       '-framerate',
       String(this.settings.fps),
       '-i',
-      framePattern(chunkIndex),
-      ...(hasAudio ? ['-i', audioFileName(chunkIndex)] : []),
-      ...segmentEncodingOptions(this.settings, frameCount, hasAudio),
+      framePattern(chunkIndex, this.preserveAlpha ? 'png' : 'jpg'),
+      ...segmentEncodingOptions(this.settings, frameCount, this.preserveAlpha),
       output,
     ]
 
@@ -99,6 +114,7 @@ export class FfmpegSegmentEncoder implements SegmentEncoder {
 
   async concat(
     segments: Uint8Array[],
+    audioPcm: Uint8Array | null,
     signal?: AbortSignal,
     onProgress?: (ratio: number) => void,
   ): Promise<Uint8Array> {
@@ -114,10 +130,15 @@ export class FfmpegSegmentEncoder implements SegmentEncoder {
       names.push(listName)
       await this.session.writeFile(listName, list, this.ledger)
 
+      if (audioPcm) {
+        names.push(audioFileName())
+        await this.session.writeFile(audioFileName(), audioPcm, this.ledger)
+      }
+
       const output = finalFileName(this.settings)
       names.push(output)
       this.ledger.track(output)
-      const exitCode = await this.session.exec(concatArgs(this.settings), {
+      const exitCode = await this.session.exec(concatArgs(this.settings, audioPcm !== null), {
         signal,
         timeout: concatTimeoutMs(),
         onProgress: onProgress ? (event) => onProgress(clamp01(event.progress)) : undefined,
@@ -126,18 +147,17 @@ export class FfmpegSegmentEncoder implements SegmentEncoder {
       return await this.session.readFile(output)
     } finally {
       // Release both JS-side references and MEMFS entries immediately.
-      for (const name of names) {
-        await this.session.deleteFile(name, this.ledger)
-      }
+      await deleteFiles(this.session, names, this.ledger)
     }
   }
 
-  async discardChunk(chunkIndex: number, frameCount: number, hasAudio: boolean): Promise<void> {
+  async discardChunk(chunkIndex: number, frameCount: number): Promise<void> {
+    const names: string[] = []
     for (let frame = 0; frame < frameCount; frame++) {
-      await this.session.deleteFile(frameFileName(chunkIndex, frame), this.ledger)
+      names.push(frameFileName(chunkIndex, frame, this.preserveAlpha ? 'png' : 'jpg'))
     }
-    if (hasAudio) await this.session.deleteFile(audioFileName(chunkIndex), this.ledger)
-    await this.session.deleteFile(segmentFileName(chunkIndex, this.settings), this.ledger)
+    names.push(segmentFileName(chunkIndex, this.settings))
+    await deleteFiles(this.session, names, this.ledger)
   }
 
   async cleanup(): Promise<void> {
@@ -154,8 +174,12 @@ export class FfmpegSegmentEncoder implements SegmentEncoder {
 }
 
 /** Convenience constructor for the default dependency graph. */
-export function createFfmpegEncoder(session: FFmpegSession, settings: ExportSettings): FfmpegSegmentEncoder {
-  return new FfmpegSegmentEncoder(session, settings)
+export function createFfmpegEncoder(
+  session: FFmpegSession,
+  settings: ExportSettings,
+  preserveAlpha = false,
+): FfmpegSegmentEncoder {
+  return new FfmpegSegmentEncoder(session, settings, preserveAlpha)
 }
 
 function clamp01(value: number): number {

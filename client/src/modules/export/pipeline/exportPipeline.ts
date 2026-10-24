@@ -3,8 +3,15 @@
  *
  * High-level flow:
  *   normalize settings → load FFmpeg/media → for each frame chunk:
- *     render frames → mix its audio slice → encode a standalone segment
- *   → losslessly concatenate segments → return one Blob.
+ *     render frames → mix its audio slice into one global PCM buffer →
+ *     encode a standalone video-only segment
+ *   → losslessly concatenate segments and mux the PCM track ONCE → return a Blob.
+ *
+ * Why audio is handled only at the end:
+ *   every AAC/Opus encode carries encoder priming/padding. Encoding audio per
+ *   chunk and concatenating the streams accumulates that delay, which shows up
+ *   as increasing lip-sync drift. One continuous raw PCM track has no priming
+ *   and is encoded exactly once by the final mux pass.
  *
  * The renderer and encoder are injected, so this module has no DOM/FFmpeg
  * dependency and can be tested with fakes (including cancellation + cleanup).
@@ -24,20 +31,31 @@ import { throwIfAborted, withRetry } from '../utils/async'
 import { normalizeExportSettings } from '../settings'
 import {
   chunkFrameCount,
+  exportAudioSampleCount,
   exportDurationMs,
+  planAudioPcmChunks,
   planAudioSegments,
   planChunks,
   planClips,
+  planPreservesAlpha,
   totalFramesFor,
 } from './timelinePlan'
 import { computeOverallProgress, createProgressReporter, estimateRemainingMs } from './progress'
 import { mixAudioChunk, normalizationGain } from '../audio/mixer'
-import { encodeWav } from '../audio/wav'
+import { encodePcm16Mono, pcm16ByteLength } from '../audio/pcm'
 import { exportFileName, outputMimeType } from '../encoding/args'
 import { defaultExportDependencies } from './defaultDependencies'
 import { ResourceManager } from '../utils/resourceManager'
 
 export const AUDIO_SAMPLE_RATE = 48_000
+
+/**
+ * How many frame files may be in flight at once. Rendering (seek + draw +
+ * JPEG/PNG encode) and writing into FFmpeg's MEMFS both cross async worker
+ * boundaries, so overlapping a few of them hides that latency without letting
+ * raw frames pile up in memory.
+ */
+const MAX_PENDING_WRITES = 4
 
 export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promise<ExportResult> {
   const settings = normalizeExportSettings(job.settings)
@@ -66,6 +84,15 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
     })
   }
   const chunks = planChunks(totalFrames, settings.fps, chunkFrameCount(settings.width, settings.height, settings.fps))
+  const pcmChunks = planAudioPcmChunks(chunks, settings.fps, AUDIO_SAMPLE_RATE)
+  const totalAudioSamples = exportAudioSampleCount(totalFrames, settings.fps, AUDIO_SAMPLE_RATE)
+
+  // Alpha depends only on the clip/source plan, so it can be decided before
+  // the (async) renderer/encoder start. VP9/WebM is the only container we write
+  // that can carry an alpha channel; MP4 codecs flatten transparency to black.
+  const initialPlan = planClips(job.clips, job.videos, job.activeVideoId)
+  const preserveAlpha = planPreservesAlpha(initialPlan, job.videos, settings.codec)
+
   const reporter = createProgressReporter((progress) => hooks.onProgress?.(progress), 100, now)
 
   let stage: ExportProgress['stage'] = 'initializing'
@@ -120,7 +147,11 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
     )
   }
 
-  log(`settings ${settings.codec} ${settings.width}x${settings.height}@${settings.fps}, ${totalFrames} frames in ${chunks.length} chunk(s)`)
+  log(
+    `settings ${settings.codec} ${settings.width}x${settings.height}@${settings.fps}, ` +
+      `${totalFrames} frames in ${chunks.length} chunk(s)` +
+      (preserveAlpha ? ', alpha PNG → yuva420p' : ''),
+  )
 
   let renderer: FrameRenderer | null = null
   let encoder: SegmentEncoder | null = null
@@ -158,9 +189,10 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
     report(true)
 
     const audioPromise = resolveAudioSources(job, deps, signal)
-    const encoderPromise = deps.createEncoder(settings, { signal, onLog: log })
+    const encoderPromise = deps.createEncoder(settings, { signal, onLog: log, preserveAlpha })
     const rendererPromise = deps.createRenderer(job, settings, {
       signal,
+      preserveAlpha,
       onAssetProgress: (ratio) => {
         assetFraction = Math.max(assetFraction, clamp01(ratio))
         report(true)
@@ -201,7 +233,14 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
     const hasAudio = audioSegments.length > 0
     const mixdowns = [...new Set(audioSegments.map((segment) => segment.source))]
     const gain = normalizationGain(mixdowns)
-    log(`audio ${hasAudio ? `${audioSegments.length} segment(s)` : 'silent'}`)
+    // One precisely sized mono PCM track for the whole export. Chunks fill it
+    // at absolute sample offsets, so no boundary rounding can accumulate.
+    const audioPcm = hasAudio ? new Uint8Array(pcm16ByteLength(totalAudioSamples)) : null
+    log(
+      hasAudio
+        ? `audio ${audioSegments.length} segment(s), ${totalAudioSamples} samples @ ${AUDIO_SAMPLE_RATE}Hz (one PCM track)`
+        : 'audio silent',
+    )
 
     const segments: Uint8Array[] = []
     renderStartedAt = now()
@@ -215,27 +254,46 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
       report(true)
 
       try {
+        const renderStarted = now()
+        const pendingWrites: Promise<void>[] = []
+        // Failures are re-thrown when the queue is awaited; attaching a catch
+        // here only prevents an unhandled rejection while a write is queued.
+        const enqueueWrite = (write: Promise<void>) => {
+          write.catch(() => {})
+          pendingWrites.push(write)
+        }
+
         for (let frame = chunk.startFrame; frame < chunk.endFrame; frame++) {
           throwIfAborted(signal, () => new ExportCancelledError(collectLogs(logs, encoder)))
           const timelineMs = (frame / settings.fps) * 1000
           const bytes = await renderer.renderFrame(frame, timelineMs, signal)
-          await encoder.writeFrame(chunk.index, frame - chunk.startFrame, bytes)
+          enqueueWrite(encoder.writeFrame(chunk.index, frame - chunk.startFrame, bytes))
           framesRendered++
           chunkRenderFraction = (frame - chunk.startFrame + 1) / localFrames
           report()
+          if (pendingWrites.length >= MAX_PENDING_WRITES) {
+            await pendingWrites.shift()
+          }
         }
+        while (pendingWrites.length > 0) await pendingWrites.shift()
+        const renderMs = Math.max(0, now() - renderStarted)
 
-        let wav: Uint8Array | null = null
-        if (hasAudio) {
+        let audioMixMs = 0
+        if (hasAudio && audioPcm) {
           stage = 'audio'
           detail = `Mixing audio · chunk ${chunk.index + 1} / ${chunks.length}`
           report(true)
+          const pcmChunk = pcmChunks[chunk.index]
+          const mixStarted = now()
           const mixed = mixAudioChunk(audioSegments, chunk.startMs, chunk.endMs, {
             targetSampleRate: AUDIO_SAMPLE_RATE,
-            channels: 2,
+            channels: 1,
             gain,
+            startSample: pcmChunk.startSample,
+            lengthSamples: pcmChunk.sampleCount,
           })
-          wav = encodeWav(mixed.channels, AUDIO_SAMPLE_RATE)
+          encodePcm16Mono(mixed.channels[0], audioPcm, pcmChunk.startByte)
+          audioMixMs = Math.max(0, now() - mixStarted)
         }
 
         stage = 'encoding'
@@ -245,7 +303,7 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
         const encodingStartedAt = now()
         const segment = await withRetry(
           () =>
-            encoder!.encodeChunk(chunk.index, localFrames, wav, signal, (ratio) => {
+            encoder!.encodeChunk(chunk.index, localFrames, signal, (ratio) => {
               chunkEncodeFraction = clamp01(ratio)
               report()
             }),
@@ -269,13 +327,15 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
         chunkEncodeFraction = 1
         const heapMb = currentHeapMb()
         log(
-          `chunk ${chunk.index + 1}/${chunks.length} encoded in ${(encodeMs / 1000).toFixed(1)}s ` +
+          `chunk ${chunk.index + 1}/${chunks.length} · render ${(renderMs / 1000).toFixed(1)}s ` +
+            `(${localFrames}f) · audio ${(audioMixMs / 1000).toFixed(2)}s · ` +
+            `encode ${(encodeMs / 1000).toFixed(1)}s ` +
             `(${Math.round(segment.byteLength / 1024)} KB${heapMb !== null ? `, heap ${heapMb} MB` : ''})`,
         )
         report(true)
       } finally {
         try {
-          await encoder.discardChunk(chunk.index, localFrames, hasAudio)
+          await encoder.discardChunk(chunk.index, localFrames)
         } catch (error) {
           log(`chunk ${chunk.index + 1} cleanup warning: ${error instanceof Error ? error.message : String(error)}`)
         }
@@ -284,21 +344,25 @@ export async function runExport(job: ExportJob, hooks: ExportHooks = {}): Promis
 
     throwIfAborted(signal, () => new ExportCancelledError(collectLogs(logs, encoder)))
     stage = 'finalizing'
-    detail = `Joining ${segments.length} encoded segment(s)…`
+    detail = `Joining ${segments.length} encoded segment(s) and muxing audio…`
     finalizeFraction = 0
     report(true)
-    const output = await encoder.concat(segments, signal, (ratio) => {
+    const finalizeStarted = now()
+    const output = await encoder.concat(segments, audioPcm, signal, (ratio) => {
       finalizeFraction = clamp01(ratio)
       report()
     })
+    const finalizeMs = Math.max(0, now() - finalizeStarted)
     segments.length = 0
+    log(`final mux ${(finalizeMs / 1000).toFixed(1)}s${hasAudio ? ' (video copy + one AAC/Opus pass)' : ''}`)
 
     const blob = new Blob([output as unknown as BlobPart], { type: outputMimeType(settings.codec) })
     const result: ExportResult = {
       blob,
       filename: exportFileName(job.projectName, settings.codec),
       mimeType: outputMimeType(settings.codec),
-      durationMs,
+      // Match what was actually encoded on the frame grid.
+      durationMs: (totalFrames / settings.fps) * 1000,
       totalFrames,
       logs: collectLogs(logs, encoder),
     }
@@ -337,6 +401,11 @@ async function resolveAudioSources(
   const resolved: ExportVideoSource[] = []
   for (const source of job.videos) {
     throwIfAborted(signal)
+    // Stills never contribute audio; skip the fetch/decode entirely.
+    if (source.kind === 'image') {
+      resolved.push({ ...source, mixdown: null })
+      continue
+    }
     if (source.mixdown) {
       resolved.push(source)
       continue

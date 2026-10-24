@@ -240,6 +240,12 @@ export function ExportDialog() {
             </select>
           </label>
 
+          <p className="text-[10px] leading-relaxed text-zinc-600 sm:col-span-2">
+            {settings.codec === 'vp9'
+              ? 'VP9/WebM preserves PNG transparency when the timeline contains image clips.'
+              : 'H.264/H.265 flatten image transparency. Choose VP9/WebM to keep the alpha channel.'}
+          </p>
+
           <label className="flex flex-col gap-1 text-[11px] text-zinc-500">
             Video bitrate
             <select

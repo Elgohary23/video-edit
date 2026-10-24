@@ -100,3 +100,110 @@ describe('normalizationGain', () => {
     expect(normalizationGain([constantSource(2, 10)])).toBeCloseTo(0.475, 6)
   })
 })
+
+describe('mixAudioChunk absolute sample grid', () => {
+  /** Ramp source so we can see exactly which source instant a chunk sampled. */
+  function rampSource(durationMs: number, sampleRate = 1000): ExportAudioMixdown {
+    const samples = new Float32Array(Math.round((durationMs * sampleRate) / 1000))
+    for (let i = 0; i < samples.length; i++) samples[i] = i / samples.length
+    return { samples, sampleRate, durationMs }
+  }
+
+  const baseSource = rampSource(2000)
+  const baseSegment: AudioMixSegment = {
+    timelineStartMs: 0,
+    timelineEndMs: 2000,
+    sourceStartMs: 0,
+    source: baseSource,
+  }
+
+  it('continues a source exactly where the previous chunk stopped', () => {
+    const full = mixAudioChunk([baseSegment], 0, 2000, {
+      targetSampleRate: 1000,
+      channels: 1,
+      fadeMs: 0,
+    })
+    const second = mixAudioChunk([baseSegment], 1000, 2000, {
+      targetSampleRate: 1000,
+      channels: 1,
+      fadeMs: 0,
+      startSample: 1000,
+      lengthSamples: 1000,
+    })
+    expect(second.channels[0][0]).toBeCloseTo(full.channels[0][1000], 9)
+    expect(second.channels[0][999]).toBeCloseTo(full.channels[0][1999], 9)
+  })
+
+  it('derives timeline time from the absolute output sample, not the local index', () => {
+    const source = rampSource(2000)
+    const segment: AudioMixSegment = {
+      timelineStartMs: 0,
+      timelineEndMs: 2000,
+      sourceStartMs: 0,
+      source,
+    }
+    const second = mixAudioChunk([segment], 1000, 2000, {
+      targetSampleRate: 1000,
+      channels: 1,
+      fadeMs: 0,
+      startSample: 1000,
+      lengthSamples: 1000,
+    })
+    // A local-index bug would restart at source sample 0 (value 0).
+    expect(second.channels[0][0]).toBeCloseTo(1000 / source.samples.length, 9)
+    expect(second.channels[0][0]).toBeGreaterThan(0)
+  })
+
+  it('respects a source offset when the clip starts mid-chunk', () => {
+    const source = rampSource(2000)
+    const mixed = mixAudioChunk(
+      [{ timelineStartMs: 500, timelineEndMs: 1500, sourceStartMs: 1200, source }],
+      500,
+      1500,
+      { targetSampleRate: 1000, channels: 1, fadeMs: 0, startSample: 500, lengthSamples: 1000 },
+    )
+    // At timeline 500 → source 1200ms → ramp value 1200/2000.
+    expect(mixed.channels[0][0]).toBeCloseTo(1200 / source.samples.length, 6)
+    expect(mixed.channels[0][1]).toBeCloseTo(1201 / source.samples.length, 6)
+  })
+
+  it('uses lengthSamples instead of the chunk duration when they disagree', () => {
+    const mixed = mixAudioChunk([baseSegment], 0, 1000, {
+      targetSampleRate: 1000,
+      channels: 2,
+      fadeMs: 0,
+      startSample: 0,
+      lengthSamples: 500,
+    })
+    expect(mixed.channels[0]).toHaveLength(500)
+    expect(mixed.channels[1]).toHaveLength(500)
+  })
+
+  it('keeps chunk boundaries gapless across a long run', () => {
+    const chunks: Float32Array[] = []
+    const chunkSamples = 333 // deliberately not a divisor of the timeline
+    for (let start = 0; start < 2000; start += chunkSamples) {
+      const length = Math.min(chunkSamples, 2000 - start)
+      const mixed = mixAudioChunk([baseSegment], start, start + length, {
+        targetSampleRate: 1000,
+        channels: 1,
+        fadeMs: 0,
+        startSample: start,
+        lengthSamples: length,
+      })
+      chunks.push(mixed.channels[0])
+    }
+    const joined = new Float32Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0))
+    let offset = 0
+    for (const chunk of chunks) {
+      joined.set(chunk, offset)
+      offset += chunk.length
+    }
+    const full = mixAudioChunk([baseSegment], 0, 2000, {
+      targetSampleRate: 1000,
+      channels: 1,
+      fadeMs: 0,
+    })
+    expect(joined).toEqual(full.channels[0])
+  })
+})

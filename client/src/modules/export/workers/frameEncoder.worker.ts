@@ -3,7 +3,7 @@
  * leave the UI thread (video seeking/drawing must stay on the main thread
  * because HTMLVideoElement is not transferable).
  */
-import { encodeBitmapToJpeg } from './frameEncodeCore'
+import { encodeBitmapToImage } from './frameEncodeCore'
 import type { FrameEncodeRequest, FrameEncodeResponse } from './frameEncoderProtocol'
 
 interface WorkerScope {
@@ -14,8 +14,8 @@ interface WorkerScope {
 const scope = self as unknown as WorkerScope
 
 scope.onmessage = (event) => {
-  const { id, bitmap, quality } = event.data
-  void encodeBitmapToJpeg(bitmap, quality)
+  const { id, bitmap, quality, format } = event.data
+  void encodeBitmapToImage(bitmap, quality, format)
     .then((bytes) => {
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
       scope.postMessage({ id, buffer }, [buffer])

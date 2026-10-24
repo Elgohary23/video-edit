@@ -24,7 +24,7 @@ interface DragSession {
  * one resolution regardless of the source video's aspect.
  */
 export function PreviewStage() {
-  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, openExportDialog, importVideo, setFitMode } = useEditor()
+  const { state, registerCanvas, play, pause, selectProp, movePropBy, resizePropBy, openExportDialog, importMedia, setFitMode } = useEditor()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const [drag, setDrag] = useState<DragSession | null>(null)
@@ -91,8 +91,8 @@ export function PreviewStage() {
 
   const onStageDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault()
-    const file = e.dataTransfer.files?.[0]
-    if (file) importVideo(file)
+    const files = Array.from(e.dataTransfer.files ?? [])
+    files.forEach((file) => importMedia(file))
   }
 
   return (
@@ -118,7 +118,7 @@ export function PreviewStage() {
           <div className="pointer-events-none absolute inset-0 grid place-items-center text-center text-sm text-zinc-500">
             <div>
               <p className="font-medium text-zinc-400">No media loaded</p>
-              <p className="mt-1 text-xs">Drop a video file anywhere on this stage</p>
+              <p className="mt-1 text-xs">Drop a video or PNG anywhere on this stage</p>
             </div>
           </div>
         )}
@@ -244,13 +244,13 @@ export function PreviewStage() {
             disabled={totalMs === 0 || busy}
             className="rounded-lg bg-accent px-3 py-1.5 font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {busy ? 'Exporting…' : 'Export MP4'}
+            {busy ? 'Exporting…' : 'Export video'}
           </button>
         </div>
       </div>
 
-      {/* Analysis progress */}
-      {state.project !== null && state.project.mixdown === null && (
+      {/* Analysis progress — stills have no audio to analyze. */}
+      {state.project !== null && state.project.kind !== 'image' && state.project.mixdown === null && (
         <div className="mx-auto w-full max-w-5xl">
           <div className="h-1 w-full overflow-hidden rounded-full bg-zinc-800">
             <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${state.analysisProgress * 100}%` }} />

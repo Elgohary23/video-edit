@@ -11,6 +11,7 @@ import { clamp } from '../../modules/shared/utils'
 import { defaultRect, type NormalizedRect } from '../../modules/props/engine'
 import { DEFAULT_EXPORT_SETTINGS, normalizeExportSettings } from '../../modules/export/settings'
 import { isExportBusy, type ExportSettings, type ExportStage } from '../../modules/export/types'
+import type { MediaKind } from '../../modules/media/engine'
 
 export interface PropItem {
   id: string
@@ -32,16 +33,24 @@ export interface MediaInfo {
   fileName: string
   videoUrl: string
   durationMs: number
+  /** Video by default; images are static media with a configurable duration. */
+  kind?: MediaKind
   /** Set once audio analysis completes. */
   mixdown: { samples: Float32Array; sampleRate: number; durationMs: number } | null
 }
 
-/** One imported video. Several can coexist; the active one owns the timeline. */
+/**
+ * One imported media asset. Several can coexist; the active one owns the
+ * analysis/cut tools while every asset can contribute clips to the track.
+ * Images reuse `videoUrl` (an object URL) and `durationMs` as their nominal
+ * timeline length; there is no audio track to analyze.
+ */
 export interface VideoSource {
   id: string
   fileName: string
   videoUrl: string
   durationMs: number
+  kind: MediaKind
   /** Set once audio analysis completes for this source. */
   mixdown: { samples: Float32Array; sampleRate: number; durationMs: number } | null
 }
@@ -96,6 +105,8 @@ export interface EditorState {
   rotation: Rotation
   playing: boolean
   playheadMs: number
+  /** Default length for newly imported image clips (seconds in the UI). */
+  imageDurationMs: number
   exportStatus: ExportStatus
   /** Persisted export preferences (quality/resolution/fps/codec...). */
   exportSettings: ExportSettings
@@ -103,8 +114,9 @@ export interface EditorState {
 }
 
 export type EditorAction =
-  | { type: 'VIDEO_ADDED'; id: string; fileName: string; videoUrl: string; durationMs: number }
+  | { type: 'VIDEO_ADDED'; id: string; fileName: string; videoUrl: string; durationMs: number; kind?: MediaKind }
   | { type: 'VIDEO_SELECTED'; id: string }
+  | { type: 'IMAGE_DURATION_SET'; assetId: string; durationMs: number }
   | { type: 'MEDIA_FAILED' }
   | { type: 'ROTATION_SET'; rotation: Rotation }
   | { type: 'ANALYSIS_PROGRESS'; ratio: number }
@@ -164,6 +176,7 @@ export const initialEditorState: EditorState = {
   rotation: 0,
   playing: false,
   playheadMs: 0,
+  imageDurationMs: 3000,
   exportStatus: {
     phase: null,
     detail: '',
@@ -182,6 +195,16 @@ export const initialEditorState: EditorState = {
 
 /** Minimal in/out separation so motion presets always have room to play. */
 const MIN_PROP_RANGE_MS = 50
+
+/** Image clips are real timeline media: sane bounds keep them trimmable/exportable. */
+export const MIN_IMAGE_DURATION_MS = 100
+export const MAX_IMAGE_DURATION_MS = 10 * 60 * 1000
+export const DEFAULT_IMAGE_DURATION_MS = 3000
+
+export function normalizeImageDuration(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_IMAGE_DURATION_MS
+  return clamp(Math.round(value), MIN_IMAGE_DURATION_MS, MAX_IMAGE_DURATION_MS)
+}
 
 /** Delete one key from a record without mutating it. */
 function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -223,11 +246,14 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
 function baseEditorReducer(state: EditorState, action: EditorAction): EditorState {
   switch (action.type) {
     case 'VIDEO_ADDED': {
+      const kind: MediaKind = action.kind ?? 'video'
+      const durationMs = kind === 'image' ? normalizeImageDuration(action.durationMs || state.imageDurationMs) : action.durationMs
       const video: VideoSource = {
         id: action.id,
         fileName: action.fileName,
         videoUrl: action.videoUrl,
-        durationMs: action.durationMs,
+        durationMs,
+        kind,
         mixdown: null,
       }
       // NLE-style appending: a fresh import drops a full-length clip at the END
@@ -239,7 +265,7 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
         analysisProgress: 0,
         videos: [...state.videos, video],
         activeVideoId: video.id,
-        project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, mixdown: null },
+        project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, kind, mixdown: null },
         clips,
         playing: false,
       }
@@ -253,8 +279,41 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
       return {
         ...state,
         activeVideoId: video.id,
-        project: { fileName: video.fileName, videoUrl: video.videoUrl, durationMs: video.durationMs, mixdown: video.mixdown },
+        project: {
+          fileName: video.fileName,
+          videoUrl: video.videoUrl,
+          durationMs: video.durationMs,
+          kind: video.kind,
+          mixdown: video.mixdown,
+        },
         playing: false,
+      }
+    }
+
+    case 'IMAGE_DURATION_SET': {
+      const target = state.videos.find((v) => v.id === action.assetId && v.kind === 'image')
+      if (!target) return state
+      const durationMs = normalizeImageDuration(action.durationMs)
+      if (durationMs === target.durationMs) return state
+      const oldDuration = target.durationMs
+      const videos = state.videos.map((v) => (v.id === target.id ? { ...v, durationMs } : v))
+      // Full-length occurrences follow the asset; manually trimmed/split image
+      // clips keep their in/out intent and are only clamped to the new length.
+      const clips = state.clips.map((clip) => {
+        if (clip.videoId !== target.id) return clip
+        const wasFullLength = clip.srcStartMs <= 0.5 && Math.abs(clip.srcEndMs - oldDuration) <= 0.5
+        if (wasFullLength) return { ...clip, srcStartMs: 0, srcEndMs: durationMs }
+        const startMs = Math.min(clip.srcStartMs, Math.max(0, durationMs - 1))
+        const endMs = Math.min(clip.srcEndMs, durationMs)
+        if (endMs - startMs <= 0) return { ...clip, srcStartMs: 0, srcEndMs: durationMs }
+        return { ...clip, srcStartMs: startMs, srcEndMs: endMs }
+      })
+      return {
+        ...state,
+        videos,
+        clips,
+        project: state.project && state.activeVideoId === target.id ? { ...state.project, durationMs } : state.project,
+        playheadMs: clamp(state.playheadMs, 0, timelineDurationMs(clips)),
       }
     }
 
@@ -467,6 +526,7 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
           fileName: action.project.fileName,
           videoUrl: action.project.videoUrl,
           durationMs: action.project.durationMs,
+          kind: state.project?.kind ?? 'video',
           mixdown: null,
         },
         clips: action.clips,

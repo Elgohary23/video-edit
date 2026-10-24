@@ -51,7 +51,7 @@ function Toolbar() {
           disabled={!hasMedia || busy}
           className="rounded-lg bg-accent px-3 py-1.5 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          Export MP4
+          Export video
         </button>
       </div>
 

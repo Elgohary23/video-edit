@@ -25,7 +25,7 @@ async function loadCore(baseUrl: string, signal?: AbortSignal): Promise<{ coreUR
 
 async function createEncoder(
   settings: ExportSettings,
-  options: { signal?: AbortSignal; onLog?: (line: string) => void },
+  options: { signal?: AbortSignal; onLog?: (line: string) => void; preserveAlpha?: boolean },
 ) {
   const session = await loadFFmpegSession({
     loader: ({ baseUrl }) => loadCore(baseUrl, options.signal),
@@ -33,7 +33,7 @@ async function createEncoder(
   throwIfAborted(options.signal)
   session.clearLogs()
   options.onLog?.('FFmpeg core ready')
-  return createFfmpegEncoder(session, settings)
+  return createFfmpegEncoder(session, settings, options.preserveAlpha === true)
 }
 
 export const defaultExportDependencies: ExportDependencies = {

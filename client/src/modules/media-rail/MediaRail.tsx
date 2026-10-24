@@ -1,6 +1,8 @@
 import { useRef, type DragEvent } from 'react'
 import { useEditor } from '../../app/state/EditorProvider'
 import { clipsOfSource } from '../../app/state/editor'
+import { mediaKindOf } from '../media/engine'
+import { setMediaDragData } from '../media/drag'
 import { PanelSection } from '../shared/ui/PanelSection'
 import { MOTION_PRESET_NAMES, type MotionPresetName } from '../motion/engine'
 
@@ -36,7 +38,7 @@ function SliderRow({ label, value, min, max, step, suffix, onChange }: {
 
 /** Left rail: media import (single or multiple videos), jump-cut controls, blur, and props. */
 export function MediaRail() {
-  const { state, importVideo, selectVideo, addTimelineClip, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
+  const { state, importMedia, setImageDuration, selectVideo, addTimelineClip, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setBlurEnabled, setBlurPx, addProp, selectProp, removeProp, setPropPreset } = useEditor()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const propInputRef = useRef<HTMLInputElement>(null)
 
@@ -54,8 +56,8 @@ export function MediaRail() {
 
   const onFileDrop = (e: DragEvent<HTMLElement>) => {
     e.preventDefault()
-    const files = Array.from(e.dataTransfer.files ?? []).filter((f) => f.type === '' || f.type.startsWith('video/'))
-    files.forEach((f) => importVideo(f))
+    const files = Array.from(e.dataTransfer.files ?? []).filter((f) => mediaKindOf(f.type, f.name) !== null)
+    files.forEach((f) => importMedia(f))
   }
 
   return (
@@ -83,12 +85,12 @@ export function MediaRail() {
                 onClick={() => fileInputRef.current?.click()}
                 className="mt-2 block text-[11px] text-accent underline-offset-2 hover:underline"
               >
-                Import another video
+                Import video or image
               </button>
             </>
           ) : (
             <>
-              <p>Drag &amp; drop a video file here</p>
+              <p>Drag &amp; drop a video or PNG here</p>
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
@@ -101,42 +103,82 @@ export function MediaRail() {
           <input
             ref={fileInputRef}
             type="file"
-            accept="video/*"
+            accept="video/*,image/png,image/jpeg,image/webp,image/gif,image/avif,image/bmp"
             multiple
             className="hidden"
             onChange={(e) => {
               const files = Array.from(e.target.files ?? [])
-              files.forEach((f) => importVideo(f))
+              files.forEach((f) => importMedia(f))
               e.target.value = ''
             }}
           />
-          {state.videos.length > 1 && (
+          {state.videos.length > 0 && (
             <ul className="mt-3 space-y-1 border-t border-line pt-3">
               {state.videos.map((video) => {
                 const active = video.id === state.activeVideoId
+                const isImage = video.kind === 'image'
                 return (
                   <li key={video.id}>
                     <div
                       role="button"
                       tabIndex={0}
-                      title={active ? 'Currently editing' : `Switch to ${video.fileName}`}
+                      draggable
+                      title={
+                        active
+                          ? 'Currently editing — drag to the timeline to append'
+                          : `Switch to ${video.fileName} — drag to the timeline to append`
+                      }
                       onClick={() => selectVideo(video.id)}
+                      onDragStart={(e) => {
+                        setMediaDragData(e.dataTransfer, video.id)
+                        e.dataTransfer.effectAllowed = 'copy'
+                      }}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter' || e.key === ' ') selectVideo(video.id)
                       }}
-                      className={`flex w-full cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] transition-colors ${
+                      className={`flex w-full cursor-grab items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] transition-colors active:cursor-grabbing ${
                         active ? 'bg-zinc-800/80 text-zinc-200' : 'text-zinc-500 hover:bg-zinc-800/40'
                       }`}
                     >
                       <span aria-hidden className={`size-1.5 shrink-0 rounded-full ${active ? 'bg-accent' : 'bg-zinc-600'}`} />
+                      {isImage && (
+                        <span className="shrink-0 rounded border border-accent/40 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-accent">
+                          IMG
+                        </span>
+                      )}
                       <span className="min-w-0 flex-1 truncate">{video.fileName}</span>
-                      <span className="shrink-0 tabular-nums text-zinc-600">
-                        {Math.round(video.durationMs / 100) / 10}s
-                      </span>
+                      {isImage ? (
+                        <label
+                          className="flex shrink-0 items-center gap-1 text-zinc-500"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <input
+                            type="number"
+                            min={0.1}
+                            max={600}
+                            step={0.1}
+                            value={Math.round(video.durationMs / 100) / 10}
+                            aria-label={`Duration for ${video.fileName} in seconds`}
+                            onKeyDown={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const seconds = Number(e.target.value)
+                              if (Number.isFinite(seconds) && seconds > 0) {
+                                setImageDuration(video.id, seconds * 1000)
+                              }
+                            }}
+                            className="w-12 rounded border border-line bg-zinc-900 px-1 py-0.5 text-right text-[10px] tabular-nums text-zinc-300"
+                          />
+                          s
+                        </label>
+                      ) : (
+                        <span className="shrink-0 tabular-nums text-zinc-600">
+                          {Math.round(video.durationMs / 100) / 10}s
+                        </span>
+                      )}
                       <button
                         type="button"
                         aria-label={`Add ${video.fileName} to the timeline`}
-                        title="Append this full video at the end of the timeline"
+                        title="Append this full asset at the end of the timeline"
                         onClick={(e) => {
                           e.stopPropagation()
                           addTimelineClip(video.id)

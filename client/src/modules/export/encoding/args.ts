@@ -31,20 +31,24 @@ export function exportFileName(projectName: string, codec: ExportCodec = 'h264')
   return `${cleaned.length > 0 ? cleaned : 'cut'}-export.${outputExtension(codec)}`
 }
 
+/** Lossless-ish JPEG is the default intermediate; VP9 alpha needs PNG. */
+export type FrameFormat = 'jpg' | 'png'
+
 /** Unique per-chunk frame file (root of FFmpeg's MEMFS). */
-export function frameFileName(chunkIndex: number, localFrameIndex: number): string {
+export function frameFileName(chunkIndex: number, localFrameIndex: number, format: FrameFormat = 'jpg'): string {
   const chunk = String(chunkIndex).padStart(4, '0')
   const frame = String(localFrameIndex + 1).padStart(6, '0')
-  return `frame-${chunk}-${frame}.jpg`
+  return `frame-${chunk}-${frame}.${format}`
 }
 
 /** image2 sequence pattern matching `frameFileName`. */
-export function framePattern(chunkIndex: number): string {
-  return `frame-${String(chunkIndex).padStart(4, '0')}-%06d.jpg`
+export function framePattern(chunkIndex: number, format: FrameFormat = 'jpg'): string {
+  return `frame-${String(chunkIndex).padStart(4, '0')}-%06d.${format}`
 }
 
-export function audioFileName(chunkIndex: number): string {
-  return `audio-${String(chunkIndex).padStart(4, '0')}.wav`
+/** One continuous raw 16-bit mono PCM track, muxed exactly once. */
+export function audioFileName(): string {
+  return 'audio-mix.pcm'
 }
 
 export function segmentFileName(chunkIndex: number, settings: ExportSettings): string {
@@ -100,23 +104,29 @@ function audioCodecArgs(settings: ExportSettings): string[] {
     : ['-c:a', 'aac', '-b:a', `${settings.audioBitrate}k`, '-ar', '48000', '-ac', '2']
 }
 
-/** Output-side encoding options shared by segments and callers/tests. */
+/**
+ * Output-side encoding options shared by segments and callers/tests.
+ * Segments are always video-only; `preserveAlpha` switches to an alpha-capable
+ * pixel format so PNG frames from image-only timelines survive VP9 export.
+ */
 export function segmentEncodingOptions(
   settings: ExportSettings,
   frameCount: number,
-  hasAudio: boolean,
+  preserveAlpha = false,
 ): string[] {
   return [
     ...videoCodecArgs(settings),
     '-pix_fmt',
-    'yuv420p',
+    preserveAlpha ? 'yuva420p' : 'yuv420p',
+    // libvpx's alternate reference frames are incompatible with alpha.
+    ...(preserveAlpha ? ['-auto-alt-ref', '0'] : []),
     '-r',
     String(settings.fps),
     '-g',
     String(Math.max(1, Math.round(settings.fps * 2))),
     '-frames:v',
     String(frameCount),
-    ...(hasAudio ? [...audioCodecArgs(settings), '-shortest'] : ['-an']),
+    '-an',
   ]
 }
 
@@ -128,21 +138,24 @@ export function segmentEncodeArgs(
   settings: ExportSettings,
   chunkIndex: number,
   frameCount: number,
-  hasAudio: boolean,
+  preserveAlpha = false,
 ): string[] {
   return [
     '-framerate',
     String(settings.fps),
     '-i',
-    framePattern(chunkIndex),
-    ...(hasAudio ? ['-i', audioFileName(chunkIndex)] : []),
-    ...segmentEncodingOptions(settings, frameCount, hasAudio),
+    framePattern(chunkIndex, preserveAlpha ? 'png' : 'jpg'),
+    ...segmentEncodingOptions(settings, frameCount, preserveAlpha),
     segmentFileName(chunkIndex, settings),
   ]
 }
 
-/** Losslessly join the encoded chunks into the deliverable. */
-export function concatArgs(settings: ExportSettings): string[] {
+/**
+ * Losslessly join the encoded chunks and mux the ONE continuous PCM track.
+ * Encoding audio once (instead of per chunk) is what keeps lip-sync stable:
+ * AAC/Opus priming exists only once, at the start of the output.
+ */
+export function concatArgs(settings: ExportSettings, hasAudio: boolean): string[] {
   return [
     '-f',
     'concat',
@@ -150,7 +163,11 @@ export function concatArgs(settings: ExportSettings): string[] {
     '0',
     '-i',
     concatListName(),
-    '-c',
+    ...(hasAudio ? ['-f', 's16le', '-ar', '48000', '-ac', '1', '-i', audioFileName()] : []),
+    '-map',
+    '0:v:0',
+    ...(hasAudio ? ['-map', '1:a:0', ...audioCodecArgs(settings), '-shortest'] : []),
+    '-c:v',
     'copy',
     ...(codecContainer(settings.codec) === 'mp4' ? ['-movflags', '+faststart'] : []),
     finalFileName(settings),

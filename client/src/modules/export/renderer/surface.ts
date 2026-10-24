@@ -15,13 +15,13 @@ export interface ExportSurface {
   dispose(): void
 }
 
-export function createExportSurface(width: number, height: number): ExportSurface {
+export function createExportSurface(width: number, height: number, alpha = false): ExportSurface {
   const w = Math.max(16, Math.round(width))
   const h = Math.max(16, Math.round(height))
 
   if (typeof OffscreenCanvas !== 'undefined') {
     const canvas = new OffscreenCanvas(w, h)
-    const ctx = canvas.getContext('2d', { alpha: false })
+    const ctx = canvas.getContext('2d', { alpha })
     if (!ctx) throw new Error('Could not acquire an OffscreenCanvas 2D context')
     return {
       width: w,
@@ -42,7 +42,7 @@ export function createExportSurface(width: number, height: number): ExportSurfac
   const canvas = document.createElement('canvas')
   canvas.width = w
   canvas.height = h
-  const ctx = canvas.getContext('2d', { alpha: false })
+  const ctx = canvas.getContext('2d', { alpha })
   if (!ctx) throw new Error('Could not acquire a 2D canvas context')
   return {
     width: w,

@@ -24,6 +24,14 @@ export interface AudioMixOptions {
   /** Global gain, normally from `normalizationGain`. */
   gain?: number
   fadeMs?: number
+  /**
+   * Absolute sample index of this chunk's first output sample. Supplying it
+   * places every chunk on one global sample grid (instead of restarting at 0),
+   * which is what keeps long exports free of cumulative A/V drift.
+   */
+  startSample?: number
+  /** Exact output length in samples; overrides the ms-derived length. */
+  lengthSamples?: number
 }
 
 export interface AudioMixResult {
@@ -42,7 +50,11 @@ export function mixAudioChunk(
   const channels = Math.max(1, Math.min(8, Math.round(options.channels ?? 2)))
   const globalGain = Number.isFinite(options.gain) ? (options.gain as number) : 1
   const defaultFadeMs = Math.max(0, options.fadeMs ?? 5)
-  const length = Math.max(0, Math.round(((chunkEndMs - chunkStartMs) * sampleRate) / 1000))
+  const length = Math.max(
+    0,
+    Math.round(options.lengthSamples ?? ((chunkEndMs - chunkStartMs) * sampleRate) / 1000),
+  )
+  const startSample = Math.round(options.startSample ?? (chunkStartMs * sampleRate) / 1000)
   const output = Array.from({ length: channels }, () => new Float32Array(length))
   if (length === 0) return { channels: output, peak: 0 }
 
@@ -64,7 +76,9 @@ export function mixAudioChunk(
     for (let i = 0; i < spanSamples; i++) {
       const outIndex = startOffsetSamples + i
       if (outIndex < 0 || outIndex >= length) continue
-      const timelineMs = timelineStart + (i * 1000) / sampleRate
+      // Derive time from the absolute output sample so chunk boundaries and
+      // long exports never accumulate rounding drift.
+      const timelineMs = ((startSample + outIndex) * 1000) / sampleRate
       const sourceMs = segment.sourceStartMs + (timelineMs - segment.timelineStartMs)
       if (sourceMs < 0 || sourceMs > sourceSpanMs) continue
 

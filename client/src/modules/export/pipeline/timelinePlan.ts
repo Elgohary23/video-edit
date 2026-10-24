@@ -6,7 +6,8 @@
  * durations never drift by partial frames.
  */
 import { timelineDurationMs, timelineToSource, type Clip } from '../../timeline/engine'
-import type { ExportAudioMixdown, ExportVideoSource, PlannedClip, RenderChunk } from '../types'
+import type { ExportAudioMixdown, ExportCodec, ExportVideoSource, PlannedClip, RenderChunk } from '../types'
+import { sampleAtFrame, sampleCountForFrames } from '../audio/pcm'
 
 export interface SourceRef {
   id: string
@@ -37,6 +38,9 @@ export function planClips(
   let cursor = 0
   for (const clip of clips) {
     const span = Math.max(0, clip.srcEndMs - clip.srcStartMs)
+    // Empty windows cannot contribute a frame; skipping them also keeps the
+    // binary-search assumption "sorted, non-empty spans" true.
+    if (span <= 0) continue
     planned.push({
       clip,
       sourceId: resolveClipSourceId(clip, sources, activeVideoId),
@@ -65,14 +69,30 @@ export interface FramePlacement {
   srcMs: number
 }
 
-/** Resolve the clip/source instant under a sampled timeline time. */
+/**
+ * Resolve the clip/source instant under a sampled timeline time.
+ *
+ * Binary search (plans are sorted and contiguous) keeps per-frame lookup
+ * O(log n) instead of O(n): exports routinely rasterize tens of thousands of
+ * frames against timelines with hundreds of split clips.
+ */
 export function placementAt(planned: readonly PlannedClip[], timelineMs: number): FramePlacement | null {
-  for (const entry of planned) {
-    if (timelineMs >= entry.startMs && timelineMs < entry.endMs) {
-      return { planned: entry, srcMs: entry.clip.srcStartMs + (timelineMs - entry.startMs) }
+  let low = 0
+  let high = planned.length - 1
+  let candidate = -1
+  while (low <= high) {
+    const mid = (low + high) >> 1
+    if (planned[mid].startMs <= timelineMs) {
+      candidate = mid
+      low = mid + 1
+    } else {
+      high = mid - 1
     }
   }
-  return null
+  if (candidate === -1) return null
+  const entry = planned[candidate]
+  if (timelineMs >= entry.endMs) return null
+  return { planned: entry, srcMs: entry.clip.srcStartMs + (timelineMs - entry.startMs) }
 }
 
 /** Convenience wrapper used by tests and callers that still hold raw clips. */
@@ -132,7 +152,9 @@ export function planAudioSegments(
   for (const entry of planned) {
     if (entry.sourceId === null) continue
     const source = byId.get(entry.sourceId)
-    if (!source?.mixdown || source.mixdown.samples.length === 0) continue
+    // Image assets are static: they never contribute an audio segment.
+    if (!source || source.kind === 'image') continue
+    if (!source.mixdown || source.mixdown.samples.length === 0) continue
     segments.push({
       timelineStartMs: entry.startMs,
       timelineEndMs: entry.endMs,
@@ -146,4 +168,49 @@ export function planAudioSegments(
 /** Timeline length re-exported for pipeline callers (single source of truth). */
 export function exportDurationMs(clips: Clip[]): number {
   return timelineDurationMs(clips)
+}
+
+/** Absolute sample position for one chunk boundary (never accumulated). */
+export interface AudioPcmChunk {
+  startSample: number
+  endSample: number
+  sampleCount: number
+  startByte: number
+}
+
+/**
+ * Lay chunk audio out on the exact same integer frame grid as the video.
+ * Boundaries are computed from absolute frame indices, so rounding cannot
+ * accumulate into drift over a long export.
+ */
+export function planAudioPcmChunks(
+  chunks: readonly RenderChunk[],
+  fps: number,
+  sampleRate: number,
+): AudioPcmChunk[] {
+  return chunks.map((chunk) => {
+    const startSample = sampleAtFrame(chunk.startFrame, fps, sampleRate)
+    const endSample = sampleAtFrame(chunk.endFrame, fps, sampleRate)
+    const sampleCount = Math.max(0, endSample - startSample)
+    return { startSample, endSample, sampleCount, startByte: startSample * 2 }
+  })
+}
+
+/** Total PCM samples for the exact video frame count (not the raw timeline). */
+export function exportAudioSampleCount(totalFrames: number, fps: number, sampleRate: number): number {
+  return sampleCountForFrames(totalFrames, fps, sampleRate)
+}
+
+/**
+ * Alpha is only meaningful in an alpha-capable container (VP9/WebM) and only
+ * when a still-image clip can expose the transparent canvas beneath it.
+ */
+export function planPreservesAlpha(
+  planned: readonly PlannedClip[],
+  sources: readonly ExportVideoSource[],
+  codec: ExportCodec,
+): boolean {
+  if (codec !== 'vp9') return false
+  const byId = new Map(sources.map((source) => [source.id, source]))
+  return planned.some((entry) => entry.sourceId !== null && byId.get(entry.sourceId)?.kind === 'image')
 }

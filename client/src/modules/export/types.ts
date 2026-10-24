@@ -9,6 +9,7 @@
 import type { Clip } from '../timeline/engine'
 import type { MotionPresetName } from '../motion/engine'
 import type { NormalizedRect } from '../props/engine'
+import type { MediaKind } from '../media/engine'
 
 export type ExportQuality = 'draft' | 'standard' | 'high' | 'ultra'
 export type ExportResolution = '720p' | '1080p' | '1440p' | '4k' | 'custom'
@@ -49,6 +50,10 @@ export interface ExportAudioMixdown {
 export interface ExportVideoSource {
   id: string
   url: string
+  /** Images are static: no decoding/seeking, no audio track. */
+  kind?: MediaKind
+  /** Nominal length of an image asset (video length comes from the file). */
+  durationMs?: number
   /** Available once the import's analysis finished. */
   mixdown: ExportAudioMixdown | null
 }
@@ -133,15 +138,24 @@ export interface FrameRenderer {
  */
 export interface SegmentEncoder {
   writeFrame(chunkIndex: number, localFrameIndex: number, data: Uint8Array): Promise<void>
+  /**
+   * Video-only chunk encode. Audio is deliberately NOT encoded per chunk:
+   * every AAC/Opus stream carries encoder priming, so concatenating them
+   * accumulates drift. The full PCM track is muxed once in `concat`.
+   */
   encodeChunk(
     chunkIndex: number,
     frameCount: number,
-    audioWav: Uint8Array | null,
     signal: AbortSignal | undefined,
     onProgress: (ratio: number) => void,
   ): Promise<Uint8Array>
-  concat(segments: Uint8Array[], signal?: AbortSignal, onProgress?: (ratio: number) => void): Promise<Uint8Array>
-  discardChunk(chunkIndex: number, frameCount: number, hasAudio: boolean): Promise<void>
+  concat(
+    segments: Uint8Array[],
+    audioPcm: Uint8Array | null,
+    signal?: AbortSignal,
+    onProgress?: (ratio: number) => void,
+  ): Promise<Uint8Array>
+  discardChunk(chunkIndex: number, frameCount: number): Promise<void>
   cleanup(): Promise<void>
   terminate(): void
   logs(): string[]
@@ -151,11 +165,11 @@ export interface ExportDependencies {
   createRenderer: (
     job: ExportJob,
     settings: ExportSettings,
-    options: { signal?: AbortSignal; onAssetProgress?: (ratio: number) => void },
+    options: { signal?: AbortSignal; onAssetProgress?: (ratio: number) => void; preserveAlpha?: boolean },
   ) => Promise<FrameRenderer>
   createEncoder: (
     settings: ExportSettings,
-    options: { signal?: AbortSignal; onLog?: (line: string) => void },
+    options: { signal?: AbortSignal; onLog?: (line: string) => void; preserveAlpha?: boolean },
   ) => Promise<SegmentEncoder>
   /** Decode a source's audio when analysis has not finished yet. */
   decodeAudio: (url: string, signal?: AbortSignal) => Promise<ExportAudioMixdown | null>

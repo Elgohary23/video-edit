@@ -9,15 +9,23 @@ import {
   type FitMode,
 } from './editor'
 import { dbEnvelope, buildCutPlan, type SilenceConfig } from '../../modules/audio-analysis/engine'
-import { mixdownToMono, type AudioBufferLike } from '../../modules/media/engine'
+import { mediaKindOf, mixdownToMono, type AudioBufferLike, type MediaKind } from '../../modules/media/engine'
 import { resolveMotion } from '../../modules/motion/engine'
-import { drawFrame, type CompositorSettings, type PropFrame, type VideoSource } from '../../modules/compositor/engine'
+import {
+  drawFrame,
+  PREVIEW_FRAME,
+  type CompositorSettings,
+  type PropFrame,
+  type VideoSource,
+} from '../../modules/compositor/engine'
+import { createBackdropRenderer, type BackdropRenderer } from '../../modules/compositor/backdrop'
 import {
   timelineDurationMs,
   timelineToSource,
   timelineStartOfClip,
   type Clip,
 } from '../../modules/timeline/engine'
+import { planTransport, previewPlayheadMs } from '../../modules/playback/engine'
 import { moveRect, resizeRect, type Handle as PropHandle, type NormalizedRect } from '../../modules/props/engine'
 import { saveProject as apiSaveProject, listProjects, loadProject as apiLoadProject, type SavedProjectSummary } from '../../modules/projects/api'
 import { runExport } from '../../modules/export/pipeline/exportPipeline'
@@ -28,7 +36,10 @@ import { isExportCancelled, ExportError } from '../../modules/export/utils/error
 /** Runtime message surfaced in the header (save confirmations, export errors...). */
 export interface EditorContextValue {
   state: EditorState
-  importVideo: (file: File) => void
+  /** Import a video or still image; the clip is appended to the track. */
+  importMedia: (file: File) => void
+  /** Change an image asset's nominal length (also updates its full clips). */
+  setImageDuration: (assetId: string, durationMs: number) => void
   setSilenceConfig: (config: Partial<SilenceConfig>) => void
   applySilenceCut: () => void
   resetCuts: () => void
@@ -67,16 +78,18 @@ export interface EditorContextValue {
 
 const EditorContext = createContext<EditorContextValue | null>(null)
 
-const SEEK_EPS = 0.5
-
 /** Decoded prop images, keyed by the src they were loaded from. */
 const imageEls = new Map<string, HTMLImageElement>()
+
+/** Decoded timeline images, keyed by their asset object URL. */
+const mediaImages = new Map<string, HTMLImageElement>()
 
 export function EditorProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(editorReducer, initialEditorState)
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const backdropRef = useRef<BackdropRenderer | null>(null)
 
   /** Sources-of-truth mirror so the rAF loop reads without effect re-subscribes. */
   const stateRef = useRef(state)
@@ -88,48 +101,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
   /* ── Import & audio decode ─────────────────────────────────────────────── */
 
-  const importVideo = useCallback((file: File) => {
-    const url = URL.createObjectURL(file)
-    const id = `vid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-    // Probe element: several imports can be in flight at once, so metadata is
-    // read off a scratch <video> instead of the single playback element.
-    const probe = document.createElement('video')
-    probe.preload = 'metadata'
-    probe.onloadedmetadata = () => {
-      const durationMs = Number.isFinite(probe.duration) ? probe.duration * 1000 : 0
-      // Adds the source rather than replacing it — the timeline grows with imports.
-      dispatch({ type: 'VIDEO_ADDED', id, fileName: file.name, videoUrl: url, durationMs })
-      void extractAudio(url, id)
-      probe.removeAttribute('src') // done probing; the playback element takes over
-    }
-    probe.onerror = () => {
-      URL.revokeObjectURL(url)
-      setMessage(`Could not read video: ${file.name}`)
-    }
-    probe.src = url
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setMessage])
-
-  useEffect(() => {
-    const video = videoRef.current
-    if (!video) return
-    const onEnded = () => {
-      // Only treat 'ended' as playback-finish when the timeline is truly over;
-      // mid-timeline source hops swap <video> srcs and must not reset the edit.
-      const s = stateRef.current
-      if (timelineDurationMs(s.clips) - s.playheadMs > 50) return
-      // Reset playhead and video position when playback finishes
-      dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: 0 })
-      video.currentTime = 0
-    }
-    video.addEventListener('ended', onEnded)
-    return () => {
-      video.removeEventListener('ended', onEnded)
-    }
-  }, [])
-
   /** Decode a specific import's audio track; the reducer attaches it by id. */
-  async function extractAudio(url: string, videoId: string): Promise<void> {
+  const extractAudio = useCallback(async (url: string, videoId: string): Promise<void> => {
     try {
       dispatch({ type: 'ANALYSIS_PROGRESS', ratio: 0.25 })
       const audioCtx = new AudioContext()
@@ -156,7 +129,80 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       console.error(err)
       setMessage(`Audio analysis failed: ${err instanceof Error ? err.message : 'unknown error'}`)
     }
-  }
+  }, [setMessage])
+
+  const importMedia = useCallback(
+    (file: File) => {
+      const kind: MediaKind | null = mediaKindOf(file.type, file.name)
+      if (!kind) {
+        setMessage(`Unsupported file: ${file.name}. Use a video or a PNG/JPEG/WebP image.`)
+        return
+      }
+      const url = URL.createObjectURL(file)
+      const id = `media-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+      if (kind === 'image') {
+        const image = new Image()
+        image.onload = () => {
+          mediaImages.set(url, image)
+          dispatch({
+            type: 'VIDEO_ADDED',
+            id,
+            fileName: file.name,
+            videoUrl: url,
+            durationMs: stateRef.current.imageDurationMs,
+            kind: 'image',
+          })
+        }
+        image.onerror = () => {
+          URL.revokeObjectURL(url)
+          setMessage(`Could not decode image: ${file.name}`)
+        }
+        image.src = url
+        return
+      }
+
+      // Probe element: several imports can be in flight at once, so metadata is
+      // read off a scratch <video> instead of the single playback element.
+      const probe = document.createElement('video')
+      probe.preload = 'metadata'
+      probe.onloadedmetadata = () => {
+        const durationMs = Number.isFinite(probe.duration) ? probe.duration * 1000 : 0
+        // Adds the source rather than replacing it — the timeline grows with imports.
+        dispatch({ type: 'VIDEO_ADDED', id, fileName: file.name, videoUrl: url, durationMs, kind: 'video' })
+        void extractAudio(url, id)
+        probe.removeAttribute('src') // done probing; the playback element takes over
+      }
+      probe.onerror = () => {
+        URL.revokeObjectURL(url)
+        setMessage(`Could not read video: ${file.name}`)
+      }
+      probe.src = url
+    },
+    [setMessage, extractAudio],
+  )
+
+  const setImageDuration = useCallback((assetId: string, durationMs: number) => {
+    dispatch({ type: 'IMAGE_DURATION_SET', assetId, durationMs })
+  }, [])
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    const onEnded = () => {
+      // Only treat 'ended' as playback-finish when the timeline is truly over;
+      // mid-timeline source hops swap <video> srcs and must not reset the edit.
+      const s = stateRef.current
+      const totalMs = timelineDurationMs(s.clips)
+      if (totalMs - s.playheadMs > 50) return
+      // Park at the end. Pressing Play from the end restarts at zero.
+      dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: totalMs })
+    }
+    video.addEventListener('ended', onEnded)
+    return () => {
+      video.removeEventListener('ended', onEnded)
+    }
+  }, [])
 
   /* ── Cut + zoom engines ────────────────────────────────────────────────── */
 
@@ -260,13 +306,40 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
   const play = useCallback(() => {
     const s = stateRef.current
-    if (s.clips.length === 0) return
-    dispatch({ type: 'PLAYBACK_SET', playing: true, playheadMs: s.playheadMs >= timelineDurationMs(s.clips) ? 0 : s.playheadMs })
+    const totalMs = timelineDurationMs(s.clips)
+    if (totalMs <= 0) return
+    // Starting from the parked end restarts at zero; anywhere else the
+    // playhead is already authoritative and is resumed verbatim.
+    const startMs = s.playheadMs >= totalMs - 1 ? 0 : s.playheadMs
+    dispatch({ type: 'PLAYBACK_SET', playing: true, playheadMs: startMs })
   }, [])
 
   const pause = useCallback(() => {
-    videoRef.current?.pause()
-    dispatch({ type: 'PLAYBACK_SET', playing: false })
+    const s = stateRef.current
+    const video = videoRef.current
+    const totalMs = timelineDurationMs(s.clips)
+    let playheadMs = s.playheadMs
+
+    // Capture the exact instant the user paused. The playback element can be
+    // up to one rAF tick ahead of the reducer, but a stale element (different
+    // clip, far from the planned source instant) must never move the playhead.
+    if (s.playing && video && !video.seeking && totalMs > 0) {
+      const sampleMs = previewPlayheadMs(s.playheadMs, totalMs)
+      const place = timelineToSource(s.clips, sampleMs)
+      const source = place ? clipVideoSource(s, place.clip) : null
+      if (place && source?.kind === 'video' && video.src === source.videoUrl) {
+        const srcMs = video.currentTime * 1000
+        const insideClip = srcMs >= place.clip.srcStartMs - 1 && srcMs <= place.clip.srcEndMs + 1
+        const nearPlayhead = Math.abs(srcMs - place.srcMs) <= 250
+        if (insideClip && nearPlayhead) {
+          const clipStartMs = timelineStartOfClip(s.clips, place.clipIndex)
+          playheadMs = Math.min(totalMs, clipStartMs + (srcMs - place.clip.srcStartMs))
+        }
+      }
+    }
+
+    video?.pause()
+    dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs })
   }, [])
 
   const seek = useCallback((tMs: number) => {
@@ -283,10 +356,25 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   /* ── rAF driver: compositor + timeline playback ────────────────────────── */
 
   useEffect(() => {
-    let raf = 0
+    // Preview-only backdrop cache. OffscreenCanvas support is checked before
+    // creation so jsdom/test environments never touch a 2D context here.
+    if (typeof OffscreenCanvas !== 'undefined') {
+      backdropRef.current = createBackdropRenderer(PREVIEW_FRAME.width, PREVIEW_FRAME.height)
+    }
+    return () => {
+      backdropRef.current?.dispose()
+      backdropRef.current = null
+    }
+  }, [])
 
-    const frame = () => {
+  useEffect(() => {
+    let raf = 0
+    let lastTick = performance.now()
+
+    const frame = (now: number) => {
       raf = requestAnimationFrame(frame)
+      const deltaMs = Math.max(0, Math.min(250, now - lastTick))
+      lastTick = now
       const s = stateRef.current
       const canvas = canvasRef.current
       const video = videoRef.current
@@ -298,56 +386,93 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       const ctx = canvas.getContext('2d')
       if (!ctx) return
 
-      const videoSource: VideoSource | null =
-        video && video.readyState >= 2 && s.project
-          ? { el: video, width: video.videoWidth, height: video.videoHeight, ready: true }
-          : null
-      const settings = buildCompositorSettings(s, videoSource, video)
-      drawFrame(ctx, canvas.width, canvas.height, settings)
+      const totalMs = timelineDurationMs(s.clips)
+      const playheadMs = previewPlayheadMs(s.playheadMs, totalMs)
+      const place = totalMs > 0 ? timelineToSource(s.clips, playheadMs) : null
+      const source = place ? clipVideoSource(s, place.clip) : null
+      const sourceUrl = source?.kind === 'video' ? source.videoUrl : null
 
-      if (!video) return
-
-      // The playback element follows the source of the clip under the playhead,
-      // so the single growing track can hold clips from several imports: hop
-      // <video> srcs whenever the playhead crosses a clip's source boundary.
-      const followTotal = timelineDurationMs(s.clips)
-      const follow = timelineToSource(s.clips, Math.min(s.playheadMs, Math.max(0, followTotal - 1)))
-      const followSource = follow ? clipVideoSource(s, follow.clip) : null
-      if (followSource && video.src !== followSource.videoUrl) {
-        video.pause()
-        video.src = followSource.videoUrl
-        video.currentTime = (follow?.srcMs ?? 0) / 1000
+      // Resolve the media element that belongs to the clip under the playhead.
+      // A mismatched/source-not-ready element is deliberately treated as "no
+      // frame": the compositor then holds the last good frame instead of
+      // clearing to black while the seek is in flight.
+      let media: VideoSource | null = null
+      if (source?.kind === 'image') {
+        const image = mediaImages.get(source.videoUrl)
+        if (image && image.complete && image.naturalWidth > 0) {
+          media = { el: image, width: image.naturalWidth, height: image.naturalHeight, ready: true }
+        }
+      } else if (
+        sourceUrl !== null &&
+        video &&
+        video.src === sourceUrl &&
+        video.readyState >= 2 &&
+        video.videoWidth > 0
+      ) {
+        media = { el: video, width: video.videoWidth, height: video.videoHeight, ready: true }
       }
 
-      if (!s.playing || !s.project) return
+      const backdrop = backdropRef.current
+      if (backdrop && media && s.fitMode === 'contain') backdrop.draw(media.el)
 
-      const clips = s.clips
-      const place = timelineToSource(clips, s.playheadMs)
-      if (!place) {
-        video.pause()
-        dispatch({ type: 'PLAYBACK_SET', playing: false })
+      drawFrame(
+        ctx,
+        canvas.width,
+        canvas.height,
+        buildCompositorSettings(s, media, playheadMs, {
+          holdLastFrame: true,
+          backdrop: backdrop ? backdrop.canvas : null,
+        }),
+      )
+
+      if (!video) return
+      if (totalMs <= 0) {
+        if (!video.paused) video.pause()
         return
       }
 
-      const srcT = video.currentTime * 1000
-      const inClip = srcT >= place.clip.srcStartMs - SEEK_EPS && srcT < place.clip.srcEndMs
-      const clipTL = timelineStartOfClip(clips, place.clipIndex)
+      const plan = planTransport({
+        clips: s.clips,
+        playheadMs: s.playheadMs,
+        playing: s.playing,
+        kind: source?.kind ?? null,
+        sourceUrl,
+        videoUrl: video.src || null,
+        videoTimeMs: video.currentTime * 1000,
+        videoReady: video.readyState >= 2,
+        videoSeeking: video.seeking,
+        deltaMs,
+      })
 
-      if (inClip) {
-        if (video.paused && !video.seeking) void video.play().catch(() => {})
-        dispatch({ type: 'PLAYHEAD_SET', playheadMs: clipTL + (srcT - place.clip.srcStartMs) })
-      } else if (srcT >= place.clip.srcEndMs - SEEK_EPS) {
-        // clip finished — hop to the next one or finish playback
-        if (place.clipIndex + 1 < clips.length) {
-          dispatch({ type: 'PLAYHEAD_SET', playheadMs: timelineStartOfClip(clips, place.clipIndex + 1) })
-        } else {
-          void video.play().catch(() => {})
+      switch (plan.action) {
+        case 'hold':
+          break
+        case 'pause-video':
+          if (!video.paused) video.pause()
+          break
+        case 'seek-video':
           video.pause()
-          dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: timelineDurationMs(clips) })
-        }
-      } else if (!video.seeking) {
-        // start of playback or manual seek: jump the source to the planned window
-        video.currentTime = place.srcMs / 1000
+          if (video.src !== plan.url) video.src = plan.url
+          try {
+            video.currentTime = plan.srcMs / 1000
+          } catch {
+            // Metadata is not ready yet; the next tick retries this seek.
+          }
+          break
+        case 'play-video':
+          if (video.paused && !video.seeking) void video.play().catch(() => {})
+          if (Math.abs(plan.playheadMs - s.playheadMs) > 0.5) {
+            dispatch({ type: 'PLAYHEAD_SET', playheadMs: plan.playheadMs })
+          }
+          break
+        case 'advance':
+          video.pause()
+          dispatch({ type: 'PLAYHEAD_SET', playheadMs: plan.playheadMs })
+          break
+        case 'finish':
+          video.pause()
+          dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: plan.playheadMs })
+          break
       }
     }
 
@@ -361,7 +486,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
     async (override?: Partial<ExportSettings>) => {
       const s = stateRef.current
       if (!s.project || s.clips.length === 0) {
-        setMessage('Import a video before exporting.')
+        setMessage('Import media before exporting.')
         return
       }
       if (exportAbortRef.current) return
@@ -400,6 +525,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
             videos: s.videos.map((video) => ({
               id: video.id,
               url: video.videoUrl,
+              kind: video.kind,
+              durationMs: video.durationMs,
               mixdown: video.mixdown,
             })),
             activeVideoId: s.activeVideoId,
@@ -497,7 +624,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   const openExportDialog = useCallback(() => {
     const s = stateRef.current
     if (!s.project || s.clips.length === 0) {
-      setMessage('Import a video before exporting.')
+      setMessage('Import media before exporting.')
       return
     }
     dispatch({ type: 'EXPORT_DIALOG_SET', open: true })
@@ -593,7 +720,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
   const value = useMemo<EditorContextValue>(
     () => ({
       state,
-      importVideo,
+      importMedia,
+      setImageDuration,
 
       setSilenceConfig,
       applySilenceCut,
@@ -629,7 +757,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       message,
       deleteClip,
     }),
-    [state, importVideo, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, cancelExport, openExportDialog, closeExportDialog, setExportSettings, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
+    [state, importMedia, setImageDuration, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, cancelExport, openExportDialog, closeExportDialog, setExportSettings, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
   )
 
   return (
@@ -737,22 +865,36 @@ function payloadDefaultSilence(): SilenceConfig {
   return { thresholdDb: -35, minSilenceMs: 300, paddingMs: 120 }
 }
 
-function buildCompositorSettings(s: EditorState, video: VideoSource | null, _videoEl: HTMLVideoElement | null): CompositorSettings {
-  const playhead = s.playheadMs
+interface CompositorOverrides {
+  holdLastFrame?: boolean
+  backdrop?: CanvasImageSource | null
+}
+
+function buildCompositorSettings(
+  s: EditorState,
+  video: VideoSource | null,
+  playheadMs: number,
+  overrides: CompositorOverrides = {},
+): CompositorSettings {
   const activeProps: PropFrame[] = []
   for (const prop of s.props) {
-    if (prop.range.startMs > playhead || prop.range.endMs <= playhead) continue
+    if (prop.range.startMs > playheadMs || prop.range.endMs <= playheadMs) continue
     const image = imageEls.get(prop.src)
     if (!image || !image.complete || image.naturalWidth === 0) continue
-    activeProps.push({ image, rect: prop.rect, transform: resolveMotion(prop.preset, playhead, prop.range.startMs, prop.range.endMs) })
+    activeProps.push({
+      image,
+      rect: prop.rect,
+      transform: resolveMotion(prop.preset, playheadMs, prop.range.startMs, prop.range.endMs),
+    })
   }
   return {
     clips: s.clips,
-    playheadMs: playhead,
+    playheadMs,
     blurEnabled: s.blur.enabled,
     blurPx: s.blur.px,
     fitMode: s.fitMode,
     video,
     activeProps,
+    ...overrides,
   }
 }

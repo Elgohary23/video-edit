@@ -1,7 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
 import { useEditor } from '../../app/state/EditorProvider'
 import { clipVideoSource, clipsOfSource, type VideoSource } from '../../app/state/editor'
 import { computePeaks } from '../audio-analysis/engine'
+import { mediaKindOf } from '../media/engine'
+import { isMediaDrag, readMediaDragId } from '../media/drag'
 import { timelineDurationMs, timelineStartOfClip } from '../timeline/engine'
 import { clamp } from '../shared/utils'
 import { ClipDeleteButton } from './ClipDeleteButton'
@@ -26,11 +36,13 @@ interface LaneDrag {
  * shared playhead. Pointer interactions map directly to reducer actions.
  */
 export function TimelinePanel() {
-  const { state, seek, splitClipAt, trimClipBy, setPropRange, selectProp, selectVideo } = useEditor()
+  const { state, seek, splitClipAt, trimClipBy, setPropRange, selectProp, selectVideo, addTimelineClip, importMedia } =
+    useEditor()
 
   const waveRef = useRef<HTMLCanvasElement>(null)
   const totalMs = timelineDurationMs(state.clips)
   const dragRef = useRef<LaneDrag | null>(null)
+  const [dropActive, setDropActive] = useState(false)
 
   /* ── timeline zoom (1x native, up to 4x, scrollable) ──────────────────── */
 
@@ -185,6 +197,35 @@ export function TimelinePanel() {
     dragRef.current = null
   }
 
+  /* ── dropping media onto the track ────────────────────────────────────── */
+
+  const carriesMedia = (e: DragEvent<HTMLDivElement>): boolean => {
+    const types = Array.from(e.dataTransfer.types)
+    return types.includes('Files') || isMediaDrag(e.dataTransfer)
+  }
+
+  const onTimelineDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (!carriesMedia(e)) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+    if (!dropActive) setDropActive(true)
+  }
+
+  const onTimelineDrop = (e: DragEvent<HTMLDivElement>) => {
+    if (!carriesMedia(e)) return
+    e.preventDefault()
+    setDropActive(false)
+    const assetId = readMediaDragId(e.dataTransfer)
+    if (assetId) {
+      addTimelineClip(assetId)
+      return
+    }
+    const files = Array.from(e.dataTransfer.files ?? []).filter((file) => mediaKindOf(file.type, file.name) !== null)
+    // Imports append their full clip at the end of the track, so dropping a
+    // fresh PNG here uses the exact same path as the rail's Browse button.
+    files.forEach((file) => importMedia(file))
+  }
+
   /* ── percent helpers ──────────────────────────────────────────────────── */
 
   const pct = (ms: number) => (totalMs === 0 ? 0 : (ms / totalMs) * 100)
@@ -264,7 +305,18 @@ export function TimelinePanel() {
           </div>
         )}
 
-        <div ref={scrollRef} className="overflow-x-auto overflow-y-hidden" style={{ maxHeight: 240 }}>
+        <div
+          ref={scrollRef}
+          onDragOver={onTimelineDragOver}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropActive(false)
+          }}
+          onDrop={onTimelineDrop}
+          className={`overflow-x-auto overflow-y-hidden rounded-lg transition-shadow ${
+            dropActive ? 'ring-1 ring-accent/80' : ''
+          }`}
+          style={{ maxHeight: 240 }}
+        >
           <div
             ref={lanesRef}
             className="relative space-y-2"
@@ -299,7 +351,7 @@ export function TimelinePanel() {
             <div className="relative h-9 overflow-hidden rounded-lg bg-zinc-900" data-lane>
               {empty && (
                 <span className="absolute inset-0 grid place-items-center text-[11px] text-zinc-600">
-                  {hasMedia ? 'Track empty — add a clip from the media panel' : 'Import a video to begin'}
+                  {hasMedia ? 'Track empty — add a clip from the media panel' : 'Import video or images to begin'}
                 </span>
               )}
               {state.clips.map((clip, i) => {
@@ -313,12 +365,22 @@ export function TimelinePanel() {
                     style={{
                       left: `${pct(startTL)}%`,
                       width: `max(0.5%, ${pct(span)}%)`,
-                      background: clip.zoom > 1 ? 'rgba(139, 92, 246, 0.25)' : undefined,
+                      background:
+                        source?.kind === 'image'
+                          ? 'rgba(139, 92, 246, 0.16)'
+                          : clip.zoom > 1
+                            ? 'rgba(139, 92, 246, 0.25)'
+                            : undefined,
                     }}
-                    title={`${source?.fileName ?? clip.id} · zoom ${Math.round(clip.zoom * 100)}% · double-click to split`}
+                    title={`${source?.fileName ?? clip.id}${source?.kind === 'image' ? ' · still image' : ''} · zoom ${Math.round(clip.zoom * 100)}% · double-click to split`}
                     onDoubleClick={() => splitClipAt(clip.id, state.playheadMs)}
                     onClick={() => seek(startTL)}
                   >
+                    {source?.kind === 'image' && (
+                      <span aria-hidden className="ml-1 shrink-0 text-[8px] font-semibold uppercase tracking-wide text-accent">
+                        IMG
+                      </span>
+                    )}
                     <span className="truncate px-1.5">{source?.fileName ?? clip.id}</span>
                     <ClipDeleteButton clipId={clip.id} />
                     <div
@@ -466,7 +528,13 @@ function SourceRow({ video, active, onSelect }: SourceRowProps) {
         aria-label={`${active ? 'Editing' : 'Imported'} source ${video.fileName}`}
       />
       <span className="flex shrink-0 items-center gap-1.5 text-[10px] tabular-nums text-zinc-500">
-        {video.mixdown === null && <span className="font-medium text-amber-400">analyzing…</span>}
+        {video.kind === 'image' ? (
+          <span className="rounded border border-accent/40 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-accent">
+            IMG
+          </span>
+        ) : (
+          video.mixdown === null && <span className="font-medium text-amber-400">analyzing…</span>
+        )}
         {Math.round(video.durationMs / 100) / 10}s
       </span>
       {!active && <span className="shrink-0 text-[9px] uppercase tracking-wider text-zinc-600">switch</span>}

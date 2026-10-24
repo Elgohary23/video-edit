@@ -203,8 +203,11 @@ export class FFmpegSession {
 
   /** Best-effort removal of every tracked virtual file. */
   async cleanup(ledger: FileLedger): Promise<void> {
-    for (const name of ledger.all()) {
-      await this.deleteFile(name, ledger)
+    const names = ledger.all()
+    // Bound the in-flight worker messages while still avoiding one round-trip
+    // per file (which is measurable after thousands of frame files).
+    for (let index = 0; index < names.length; index += 32) {
+      await Promise.all(names.slice(index, index + 32).map((name) => this.deleteFile(name, ledger)))
     }
     ledger.clear()
   }
