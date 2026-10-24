@@ -1,6 +1,6 @@
 # Export performance report
 
-This report covers the export-pipeline optimization work for issue 4 in `fix.txt`. It separates **measured** micro-benchmarks from **deterministic work reductions** and from **browser end-to-end timings**, which cannot be captured by the jsdom test environment.
+This report covers the export-pipeline optimization work for issue 4 in `fix.txt`. It separates **measured Node micro-benchmarks**, a **measured browser canvas component benchmark**, **deterministic work reductions**, and **full browser end-to-end timings**, which cannot be captured by the jsdom test environment.
 
 ## Environment
 
@@ -50,6 +50,22 @@ Result: **~8–9× lower mean latency** and **~8–9× higher throughput**. The 
 
 At 18,000 frames and 400 clips, that changes the lookup portion from ~7.2 million comparisons to ~162,000 (9 comparisons per frame).
 
+## Browser canvas micro-benchmark (measured)
+
+The other hot path is the letterboxed backdrop. A standalone headless-Chrome harness measured the old full-size blur against the current 1/8-size backdrop on a synthetic 1920×1080 output with a 720×1280 portrait source, using `contain` placement. Each sample renders a batch of 8 frames and flushes the canvas once with `getImageData` so queued draws are included.
+
+- Chrome 156.0.8078.47, headless, default raster backend (no GPU flags forced)
+- Old frame: full 1920×1080 `drawImage` with `filter = 'blur(20px) brightness(0.35)'`, then the main image
+- New frame: 240×135 `drawImage` with `filter = 'blur(1.5px)'`, upscale to 1920×1080, dark overlay, then the main image
+- 8 frames per sample; two consecutive runs
+
+| Run | Old full-size blur | New 1/8 backdrop | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | 24.64 ms/frame | 11.42 ms/frame | 2.16× |
+| 2 | 22.02 ms/frame | 10.11 ms/frame | 2.18× |
+
+This is a canvas-only component benchmark, not a full export: it excludes video seeking, prop compositing, JPEG encoding, and FFmpeg. It does confirm that the backdrop change removes real per-frame raster work rather than just moving it elsewhere.
+
 ## Deterministic work reduction (10-minute 1080p30 example)
 
 These are counts derived from the pipeline, not wall-clock timings. At 1080p30 the planner uses 180 frames per chunk, so 18,000 frames produce 100 chunks.
@@ -65,7 +81,7 @@ These are counts derived from the pipeline, not wall-clock timings. At 1080p30 t
 | Clip lookups | linear (up to 7.2M comparisons) | binary (~162k comparisons) |
 | Image decodes | per use | 1 per still asset |
 
-**What is not measured here:** actual FFmpeg.wasm encode time and browser canvas throughput. Those require a real browser with a real media file, WebCodecs/Canvas2D, and the bundled WASM core; jsdom cannot run them (the project’s own tests stub FFmpeg and canvas). No before/after browser wall-clock table is claimed.
+**What is not measured here:** actual FFmpeg.wasm encode time at export scale. The canvas component above is measured in a real browser, but a full export also requires real media seeks, the bundled WASM core, and container muxing; jsdom cannot run those (the project’s own tests stub FFmpeg and canvas). No full-export before/after browser wall-clock table is claimed.
 
 ## Manual browser validation procedure
 

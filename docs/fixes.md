@@ -81,8 +81,8 @@ Cross-source cuts still require an actual browser seek, so a slow decoder can sh
 
 Full analysis and measured numbers: [`export-performance.md`](./export-performance.md). Summary of changes:
 
-- Binary search (`placementAt`) replaces the per-frame linear clip scan.
-- A low-resolution pre-blurred backdrop replaces a full-size `ctx.filter = 'blur(20px)'` draw for letterboxed frames.
+- Binary search (`placementAt`) replaces the per-frame linear clip scan (measured ~8–9× faster over 400 clips).
+- A low-resolution pre-blurred backdrop replaces a full-size `ctx.filter = 'blur(20px)'` draw for letterboxed frames (measured 2.2× faster in headless Chrome: ~24.6/22.0 ms → ~11.4/10.1 ms per frame).
 - Audio is mixed once into a preallocated PCM buffer and encoded once in the final mux (previously one WAV + one audio encode per chunk).
 - Frame writes overlap up to `MAX_PENDING_WRITES = 4` instead of serializing every `writeFrame` round-trip.
 - MEMFS frame/segment deletion is batched 32 files at a time.
@@ -178,5 +178,6 @@ Tooling/docs:
 - `npm run lint` — clean.
 - `npm run build -w client` and `npm run build -w server` — pass.
 - `npm run bench -w client` — placement benchmark passes and prints the comparison table.
+- Headless Chrome 156 canvas benchmark — letterboxed backdrop 2.16–2.18× faster than the old full-size blur.
 
 No real-media browser export was available in the automated environment; see the manual validation procedure and remaining risk in `docs/export-performance.md`.
