@@ -23,9 +23,19 @@ import {
   timelineDurationMs,
   timelineToSource,
   timelineStartOfClip,
-  type Clip,
 } from '../../modules/timeline/engine'
-import { planTransport, previewPlayheadMs } from '../../modules/playback/engine'
+import {
+  PLAY_START_GUARD_MS,
+  playStartMs,
+  planTransport,
+  previewPlayheadMs,
+  stepPlayheadMs,
+} from '../../modules/playback/engine'
+import {
+  shortcutPreventsDefault,
+  transportShortcutFor,
+} from '../../modules/playback/shortcuts'
+import { serializeSnapshot, parseSnapshot, type SnapshotPayload } from './snapshot'
 import { moveRect, resizeRect, type Handle as PropHandle, type NormalizedRect } from '../../modules/props/engine'
 import { saveProject as apiSaveProject, listProjects, loadProject as apiLoadProject, type SavedProjectSummary } from '../../modules/projects/api'
 import { runExport } from '../../modules/export/pipeline/exportPipeline'
@@ -57,9 +67,24 @@ export interface EditorContextValue {
   removeProp: (id: string) => void
   setBlurEnabled: (enabled: boolean) => void
   setBlurPx: (px: number) => void
-  play: () => void
+  /** Start playback at the parked frame (or an explicit scrub-release frame). */
+  play: (fromMs?: number) => void
   pause: () => void
   seek: (tMs: number) => void
+  /** Pointer-owned scrub session; pauses the media and blocks rAF clock writes. */
+  beginScrub: () => void
+  endScrub: () => void
+  /** Step by export-frame units (negative = backward). */
+  stepFrames: (frames: number) => void
+  /** Nudge by wall-clock seconds (Shift+arrow shortcuts). */
+  stepSeconds: (seconds: number) => void
+  seekToEdge: (edge: 'start' | 'end') => void
+  /** J: stepped reverse review until K or a new transport action. */
+  startReverseShuttle: () => void
+  setLoopIn: () => void
+  setLoopOut: () => void
+  toggleLoop: () => void
+  clearLoop: () => void
   exportToMp4: (settings?: Partial<ExportSettings>) => Promise<void>
   cancelExport: () => void
   openExportDialog: () => void
@@ -97,6 +122,10 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
   /** One export at a time; abort is the single cancellation source of truth. */
   const exportAbortRef = useRef<AbortController | null>(null)
+  /** Tight media-clock tolerance window that follows a gated play start. */
+  const playGuardUntilRef = useRef(0)
+  /** Reverse review timer (J); K/play/seek clear it. */
+  const reverseShuttleTimerRef = useRef<number | null>(null)
   const [message, setMessage] = useReducerString()
 
   /* ── Import & audio decode ─────────────────────────────────────────────── */
@@ -193,6 +222,9 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       // Only treat 'ended' as playback-finish when the timeline is truly over;
       // mid-timeline source hops swap <video> srcs and must not reset the edit.
       const s = stateRef.current
+      // An active review loop owns the wrap; the rAF planner will seek back
+      // to the in-point instead of parking at the timeline end.
+      if (s.loopEnabled && s.loopRegion && s.playing) return
       const totalMs = timelineDurationMs(s.clips)
       if (totalMs - s.playheadMs > 50) return
       // Park at the end. Pressing Play from the end restarts at zero.
@@ -304,47 +336,249 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
   /* ── Playback ──────────────────────────────────────────────────────────── */
 
-  const play = useCallback(() => {
+  const stopReverseShuttle = useCallback(() => {
+    if (reverseShuttleTimerRef.current !== null) {
+      window.clearInterval(reverseShuttleTimerRef.current)
+      reverseShuttleTimerRef.current = null
+    }
+  }, [])
+
+  /**
+   * Best-effort immediate preview seek. The rAF planner remains the authority
+   * (it retries while metadata is missing); this just removes the one-tick lag
+   * for frame steps and pointer scrubs on an already-loaded source.
+   */
+  const applyPreviewSeek = useCallback((s: EditorState, targetMs: number) => {
+    const video = videoRef.current
+    const totalMs = timelineDurationMs(s.clips)
+    if (!video || totalMs <= 0) return
+    const placed = timelineToSource(s.clips, previewPlayheadMs(targetMs, totalMs))
+    const source = placed ? clipVideoSource(s, placed.clip) : null
+    if (!placed || source?.kind !== 'video') return
+    if (video.src !== source.videoUrl) {
+      // Metadata must load before currentTime is assignable; the next rAF tick
+      // performs the actual seek.
+      video.src = source.videoUrl
+      return
+    }
+    if (video.readyState < 1) return
+    try {
+      video.currentTime = placed.srcMs / 1000
+    } catch {
+      // Some browsers reject currentTime until seekable; the rAF retry covers it.
+    }
+  }, [])
+
+  /** Park the reducer and media element on an exact review instant. */
+  const parkAt = useCallback(
+    (targetMs: number) => {
+      const s = stateRef.current
+      playGuardUntilRef.current = 0
+      videoRef.current?.pause()
+      dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs: targetMs })
+      applyPreviewSeek(s, targetMs)
+    },
+    [applyPreviewSeek],
+  )
+
+  const seek = useCallback(
+    (tMs: number) => {
+      stopReverseShuttle()
+      const s = stateRef.current
+      const totalMs = timelineDurationMs(s.clips)
+      const target = Number.isFinite(tMs) ? Math.max(0, Math.min(tMs, totalMs)) : 0
+      playGuardUntilRef.current = 0
+      dispatch({ type: 'PLAYHEAD_SET', playheadMs: target })
+      applyPreviewSeek(s, target)
+    },
+    [applyPreviewSeek, stopReverseShuttle],
+  )
+
+  const stepFramesInternal = useCallback(
+    (frames: number) => {
+      const s = stateRef.current
+      const totalMs = timelineDurationMs(s.clips)
+      if (totalMs <= 0) return
+      const baseMs = s.playing ? sampledPlayheadMs(s, videoRef.current) : s.playheadMs
+      parkAt(stepPlayheadMs(baseMs, frames, s.exportSettings.fps, totalMs))
+    },
+    [parkAt],
+  )
+
+  const stepFrames = useCallback(
+    (frames: number) => {
+      stopReverseShuttle()
+      stepFramesInternal(frames)
+    },
+    [stepFramesInternal, stopReverseShuttle],
+  )
+
+  const stepSeconds = useCallback(
+    (seconds: number) => {
+      stopReverseShuttle()
+      const s = stateRef.current
+      const totalMs = timelineDurationMs(s.clips)
+      if (totalMs <= 0) return
+      const baseMs = s.playing ? sampledPlayheadMs(s, videoRef.current) : s.playheadMs
+      parkAt(Math.max(0, Math.min(baseMs + seconds * 1000, totalMs)))
+    },
+    [parkAt, stopReverseShuttle],
+  )
+
+  const seekToEdge = useCallback(
+    (edge: 'start' | 'end') => {
+      stopReverseShuttle()
+      const s = stateRef.current
+      const totalMs = timelineDurationMs(s.clips)
+      if (totalMs <= 0) return
+      parkAt(edge === 'start' ? 0 : totalMs)
+    },
+    [parkAt, stopReverseShuttle],
+  )
+
+  const startReverseShuttle = useCallback(() => {
     const s = stateRef.current
     const totalMs = timelineDurationMs(s.clips)
     if (totalMs <= 0) return
-    // Starting from the parked end restarts at zero; anywhere else the
-    // playhead is already authoritative and is resumed verbatim.
-    const startMs = s.playheadMs >= totalMs - 1 ? 0 : s.playheadMs
-    dispatch({ type: 'PLAYBACK_SET', playing: true, playheadMs: startMs })
-  }, [])
+    stopReverseShuttle()
+    const baseMs = s.playing ? sampledPlayheadMs(s, videoRef.current) : s.playheadMs
+    parkAt(baseMs)
+    reverseShuttleTimerRef.current = window.setInterval(() => {
+      stepFramesInternal(-1)
+      // The state mirror updates on the render after each dispatch; when the
+      // next tick observes zero, stop instead of spinning at the start.
+      if (stateRef.current.playheadMs <= 0) stopReverseShuttle()
+    }, REVERSE_SHUTTLE_INTERVAL_MS)
+  }, [parkAt, stepFramesInternal, stopReverseShuttle])
+
+  const play = useCallback(
+    (fromMs?: number) => {
+      const s = stateRef.current
+      const totalMs = timelineDurationMs(s.clips)
+      if (totalMs <= 0) return
+      // L is a resume command: don't restart an already-running transport.
+      // A scrub release passes fromMs explicitly and always re-enters the gate.
+      if (s.playing && !s.awaitingPlayStart && !s.scrubbing && fromMs === undefined) return
+      stopReverseShuttle()
+      const loop = s.loopEnabled ? s.loopRegion : null
+      const startMs = playStartMs(fromMs ?? s.playheadMs, totalMs, loop, s.loopEnabled)
+      playGuardUntilRef.current = 0
+      // Phase 1 of the gate: stop the old clock before the planner seeks.
+      videoRef.current?.pause()
+      dispatch({ type: 'PLAYBACK_SET', playing: true, playheadMs: startMs, awaitingStart: true })
+    },
+    [stopReverseShuttle],
+  )
 
   const pause = useCallback(() => {
+    stopReverseShuttle()
     const s = stateRef.current
     const video = videoRef.current
-    const totalMs = timelineDurationMs(s.clips)
-    let playheadMs = s.playheadMs
-
     // Capture the exact instant the user paused. The playback element can be
     // up to one rAF tick ahead of the reducer, but a stale element (different
     // clip, far from the planned source instant) must never move the playhead.
-    if (s.playing && video && !video.seeking && totalMs > 0) {
-      const sampleMs = previewPlayheadMs(s.playheadMs, totalMs)
-      const place = timelineToSource(s.clips, sampleMs)
-      const source = place ? clipVideoSource(s, place.clip) : null
-      if (place && source?.kind === 'video' && video.src === source.videoUrl) {
-        const srcMs = video.currentTime * 1000
-        const insideClip = srcMs >= place.clip.srcStartMs - 1 && srcMs <= place.clip.srcEndMs + 1
-        const nearPlayhead = Math.abs(srcMs - place.srcMs) <= 250
-        if (insideClip && nearPlayhead) {
-          const clipStartMs = timelineStartOfClip(s.clips, place.clipIndex)
-          playheadMs = Math.min(totalMs, clipStartMs + (srcMs - place.clip.srcStartMs))
-        }
-      }
-    }
-
+    const playheadMs = sampledPlayheadMs(s, video)
+    playGuardUntilRef.current = 0
     video?.pause()
     dispatch({ type: 'PLAYBACK_SET', playing: false, playheadMs })
+  }, [stopReverseShuttle])
+
+  const beginScrub = useCallback(() => {
+    stopReverseShuttle()
+    playGuardUntilRef.current = 0
+    videoRef.current?.pause()
+    dispatch({ type: 'SCRUB_BEGIN' })
+  }, [stopReverseShuttle])
+
+  const endScrub = useCallback(() => {
+    dispatch({ type: 'SCRUB_END' })
   }, [])
 
-  const seek = useCallback((tMs: number) => {
-    dispatch({ type: 'PLAYHEAD_SET', playheadMs: tMs })
-  }, [])
+  const setLoopIn = useCallback(() => dispatch({ type: 'LOOP_IN_SET' }), [])
+  const setLoopOut = useCallback(() => dispatch({ type: 'LOOP_OUT_SET' }), [])
+
+  const toggleLoop = useCallback(() => {
+    const s = stateRef.current
+    if (!s.loopRegion) {
+      setMessage('Mark a loop first: park and press I for in, then O for out.')
+      return
+    }
+    dispatch({ type: 'LOOP_ENABLED_SET', enabled: !s.loopEnabled })
+  }, [setMessage])
+
+  const clearLoop = useCallback(() => dispatch({ type: 'LOOP_CLEAR' }), [])
+
+  // The reverse review timer must not outlive the provider.
+  useEffect(() => () => stopReverseShuttle(), [stopReverseShuttle])
+
+  /* ── Keyboard transport ────────────────────────────────────────────────── */
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const s = stateRef.current
+      if (isExportBusy(s.exportStatus)) return
+      // The thumb owns navigation until pointerup; keyboard steps would fight
+      // the local draft and the pointer's exact release position.
+      if (s.scrubbing) return
+      const shortcut = transportShortcutFor(event.key, {
+        shift: event.shiftKey,
+        repeat: event.repeat,
+        ctrl: event.ctrlKey,
+        meta: event.metaKey,
+        alt: event.altKey,
+        editable: isEditableEventTarget(event.target),
+        hasTimeline: timelineDurationMs(s.clips) > 0,
+      })
+      if (!shortcut) return
+      if (shortcutPreventsDefault(shortcut)) event.preventDefault()
+
+      switch (shortcut.kind) {
+        case 'step-frames':
+          stepFrames(shortcut.frames)
+          break
+        case 'step-seconds':
+          stepSeconds(shortcut.seconds)
+          break
+        case 'seek-edge':
+          seekToEdge(shortcut.edge)
+          break
+        case 'play':
+          play()
+          break
+        case 'pause':
+          pause()
+          break
+        case 'reverse-shuttle':
+          startReverseShuttle()
+          break
+        case 'loop-in':
+          setLoopIn()
+          break
+        case 'loop-out':
+          setLoopOut()
+          break
+        case 'toggle-loop':
+          toggleLoop()
+          break
+        case 'clear-loop':
+          clearLoop()
+          break
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [
+    clearLoop,
+    pause,
+    play,
+    seekToEdge,
+    setLoopIn,
+    setLoopOut,
+    startReverseShuttle,
+    stepFrames,
+    stepSeconds,
+    toggleLoop,
+  ])
 
   const setBlurEnabled = useCallback((enabled: boolean) => dispatch({ type: 'BLUR_SET', enabled }), [])
   const setBlurPx = useCallback((px: number) => dispatch({ type: 'BLUR_STRENGTH_SET', px }), [])
@@ -442,6 +676,10 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         videoReady: video.readyState >= 2,
         videoSeeking: video.seeking,
         deltaMs,
+        scrubbing: s.scrubbing,
+        awaitingStart: s.awaitingPlayStart,
+        startGuard: now < playGuardUntilRef.current,
+        loop: s.loopEnabled ? s.loopRegion : null,
       })
 
       switch (plan.action) {
@@ -459,6 +697,14 @@ export function EditorProvider({ children }: { children: ReactNode }) {
             // Metadata is not ready yet; the next tick retries this seek.
           }
           break
+        case 'start-play':
+          // Phase 2 of the gate: the element has landed, so start the clock.
+          // The short guard keeps the old 60 ms tolerance from accepting a
+          // stale currentTime immediately after the start.
+          playGuardUntilRef.current = now + PLAY_START_GUARD_MS
+          if (source?.kind === 'video' && video.paused) void video.play().catch(() => {})
+          dispatch({ type: 'PLAY_STARTED' })
+          break
         case 'play-video':
           if (video.paused && !video.seeking) void video.play().catch(() => {})
           if (Math.abs(plan.playheadMs - s.playheadMs) > 0.5) {
@@ -468,6 +714,13 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         case 'advance':
           video.pause()
           dispatch({ type: 'PLAYHEAD_SET', playheadMs: plan.playheadMs })
+          break
+        case 'wrap-loop':
+          // Re-enter the play gate at the in-point. Until the seek lands the
+          // compositor holds the last good frame, so the wrap has no black gap.
+          video.pause()
+          playGuardUntilRef.current = 0
+          dispatch({ type: 'PLAYBACK_SET', playing: true, playheadMs: plan.playheadMs, awaitingStart: true })
           break
         case 'finish':
           video.pause()
@@ -499,6 +752,8 @@ export function EditorProvider({ children }: { children: ReactNode }) {
 
       // Export never depends on preview playback: pause the transport and
       // leave the canvas alone until the offline job finishes.
+      stopReverseShuttle()
+      playGuardUntilRef.current = 0
       videoRef.current?.pause()
       dispatch({ type: 'PLAYBACK_SET', playing: false })
       dispatch({
@@ -607,7 +862,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
         exportAbortRef.current = null
       }
     },
-    [setMessage],
+    [setMessage, stopReverseShuttle],
   )
 
   const cancelExport = useCallback(() => {
@@ -691,6 +946,9 @@ export function EditorProvider({ children }: { children: ReactNode }) {
           props: parsed.props,
           silenceConfig: parsed.silenceConfig,
           blur: parsed.blur,
+          playheadMs: parsed.playheadMs,
+          loopRegion: parsed.loopRegion,
+          loopEnabled: parsed.loopEnabled,
         })
         setMessage(`Loaded ${saved.name ?? 'project'} onto the current media.`)
       } else {
@@ -743,6 +1001,16 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       play,
       pause,
       seek,
+      beginScrub,
+      endScrub,
+      stepFrames,
+      stepSeconds,
+      seekToEdge,
+      startReverseShuttle,
+      setLoopIn,
+      setLoopOut,
+      toggleLoop,
+      clearLoop,
       exportToMp4,
       cancelExport,
       openExportDialog,
@@ -757,7 +1025,7 @@ export function EditorProvider({ children }: { children: ReactNode }) {
       message,
       deleteClip,
     }),
-    [state, importMedia, setImageDuration, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, exportToMp4, cancelExport, openExportDialog, closeExportDialog, setExportSettings, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
+    [state, importMedia, setImageDuration, setSilenceConfig, applySilenceCut, resetCuts, autoZoom, setFitMode, selectVideo, addTimelineClip, splitClipAt, trimClipBy, addProp, selectProp, updatePropRect, movePropBy, resizePropBy, setPropRange, setPropPreset, removeProp, setBlurEnabled, setBlurPx, play, pause, seek, beginScrub, endScrub, stepFrames, stepSeconds, seekToEdge, startReverseShuttle, setLoopIn, setLoopOut, toggleLoop, clearLoop, exportToMp4, cancelExport, openExportDialog, closeExportDialog, setExportSettings, saveProject, fetchProjectList, applySavedProject, registerCanvas, message, deleteClip],
   )
 
   return (
@@ -825,44 +1093,41 @@ function useReducerString(): [string, (next: string) => void] {
   return [message, setMessageRaw]
 }
 
-interface SnapshotPayload extends Record<string, unknown> {
-  version?: number
-  media?: { fileName?: string; durationMs?: number }
-  silenceConfig?: SilenceConfig
-  clips?: Clip[]
-  props?: Array<{ id: string; name: string; src: string; rect: NormalizedRect; range: { startMs: number; endMs: number }; preset: PropItem['preset'] }>
-  blur?: { enabled: boolean; px: number }
+/** Reverse review advances one frame every 100 ms (10 fps jog). */
+const REVERSE_SHUTTLE_INTERVAL_MS = 100
+
+/**
+ * The instant a pause/step command should use. While playing, the media clock
+ * is one rAF tick ahead of the reducer, so sample it only when it is inside
+ * the active clip and close to the planned source instant. A stale element
+ * must never move the playhead.
+ */
+function sampledPlayheadMs(s: EditorState, video: HTMLVideoElement | null): number {
+  const totalMs = timelineDurationMs(s.clips)
+  if (!s.playing || s.awaitingPlayStart || !video || video.seeking || totalMs <= 0) return s.playheadMs
+  const sampleMs = previewPlayheadMs(s.playheadMs, totalMs)
+  const place = timelineToSource(s.clips, sampleMs)
+  const source = place ? clipVideoSource(s, place.clip) : null
+  if (!place || source?.kind !== 'video' || video.src !== source.videoUrl) return s.playheadMs
+  const srcMs = video.currentTime * 1000
+  const insideClip = srcMs >= place.clip.srcStartMs - 1 && srcMs <= place.clip.srcEndMs + 1
+  const nearPlayhead = Math.abs(srcMs - place.srcMs) <= 250
+  if (!insideClip || !nearPlayhead) return s.playheadMs
+  const clipStartMs = timelineStartOfClip(s.clips, place.clipIndex)
+  return Math.min(totalMs, clipStartMs + (srcMs - place.clip.srcStartMs))
 }
 
-function serializeSnapshot(s: EditorState): SnapshotPayload {
-  return {
-    version: 1,
-    media: { fileName: s.project?.fileName, durationMs: s.project?.durationMs },
-    silenceConfig: s.silenceConfig,
-    clips: s.clips,
-    props: s.props,
-    blur: s.blur,
+/** Text fields, selects, and contenteditable keep their native key handling. */
+function isEditableEventTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  const tag = target.tagName
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true
+  if (tag === 'INPUT') {
+    const type = (target as HTMLInputElement).type
+    return type !== 'range' && type !== 'button' && type !== 'checkbox'
   }
-}
-
-function parseSnapshot(payload: SnapshotPayload): {
-  clips: Clip[]
-  props: PropItem[]
-  silenceConfig: SilenceConfig
-  blur: { enabled: boolean; px: number }
-} | null {
-  if (typeof payload !== 'object' || payload === null || !Array.isArray(payload.clips) || !Array.isArray(payload.props)) return null
-  return {
-    clips: payload.clips,
-    props: payload.props,
-    silenceConfig: payload.silenceConfig ?? { ...payloadDefaultSilence() },
-    blur: payload.blur ?? { enabled: false, px: 8 },
-  }
-}
-
-function payloadDefaultSilence(): SilenceConfig {
-  // avoids importing DEFAULT here twice — mirrors audio-analysis defaults
-  return { thresholdDb: -35, minSilenceMs: 300, paddingMs: 120 }
+  return false
 }
 
 interface CompositorOverrides {

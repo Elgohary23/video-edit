@@ -39,8 +39,8 @@ Run per workspace with `-w client` / `-w server`, or at the root for both:
 4. **Props** — import PNG overlays, drag & resize them on the preview, drag their in/out points on the prop track, pick a one-click motion preset (Pop & Bounce / Slide & Snap).
 5. **Background blur** — global toggle; blurs the video while any prop is on screen.
 6. **Export video** — composites the timeline (canvas + mixed audio) and encodes H.264/AAC or H.265 locally with FFmpeg.wasm; VP9/WebM is also available. Audio is mixed into one 48 kHz PCM track and muxed once, so cuts cannot accumulate A/V drift. A VP9/WebM export that contains an image clip preserves PNG transparency (`yuva420p`); MP4 codecs flatten alpha. The finished file downloads automatically.
-7. **Playback** — the playhead is the single source of truth; Play always starts at the playhead, Pause captures the current instant, and a cut never blanks the preview while the next frame is decoded.
-8. **Save/Load project** — timeline, props, and settings are persisted as JSON to the Express API; media files always stay local.
+7. **Playback** — the playhead is the single source of truth; Play always seeks to the parked frame before starting, Pause captures the exact instant, scrubbing pauses and resumes from the release point, and a cut never blanks the preview while the next frame is decoded. Review frame-by-frame (`,` / `.` or arrows), jog with `J` / `K` / `L`, and mark loop in/out with `I` / `O` (`P` toggles). See [`docs/playback-navigation.md`](./docs/playback-navigation.md) for the transport contract and manual test script.
+8. **Save/Load project** — timeline, props, review position (playhead + loop), and settings are persisted as JSON to the Express API; media files always stay local.
 
 ## Layout
 
@@ -50,5 +50,5 @@ client/src/modules/   # feature modules: audio-analysis, timeline, auto-zoom,
                       # timeline-ui, media-rail, projects, shared
 client/src/app/       # App shell + editor state (reducer + provider)
 server/src/contexts/  # DDD contexts (projects: domain/application/infrastructure/interface)
-docs/                 # fix report + export performance methodology/results
+docs/                 # fix report + playback navigation + export performance
 ```

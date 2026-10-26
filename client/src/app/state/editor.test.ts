@@ -284,11 +284,106 @@ describe('playback + export', () => {
     const next = editorReducer(s, { type: 'PLAYHEAD_SET', playheadMs: 9999 })
     expect(next.playheadMs).toBe(2800)
   })
+  it('repeated identical seeks are referentially stable', () => {
+    const once = editorReducer(stateWithClip(), { type: 'PLAYHEAD_SET', playheadMs: 800 })
+    const twice = editorReducer(once, { type: 'PLAYHEAD_SET', playheadMs: 800 })
+    expect(twice).toBe(once)
+  })
   it('playback set pauses at a position', () => {
     const next = editorReducer(stateWithClip(), { type: 'PLAYBACK_SET', playing: false, playheadMs: 120 })
     expect(next.playing).toBe(false)
     expect(next.playheadMs).toBe(120)
   })
+
+  it('scrub begin owns transport; scrub end stays paused', () => {
+    const playing = editorReducer(stateWithClip(), {
+      type: 'PLAYBACK_SET',
+      playing: true,
+      playheadMs: 400,
+      awaitingStart: true,
+    })
+    expect(playing.awaitingPlayStart).toBe(true)
+
+    const scrubbed = editorReducer(playing, { type: 'SCRUB_BEGIN' })
+    expect(scrubbed.scrubbing).toBe(true)
+    expect(scrubbed.playing).toBe(false)
+    expect(scrubbed.awaitingPlayStart).toBe(false)
+
+    const released = editorReducer(scrubbed, { type: 'SCRUB_END' })
+    expect(released.scrubbing).toBe(false)
+    expect(released.playing).toBe(false)
+  })
+
+  it('play started clears only the pending gate flag', () => {
+    const pending = editorReducer(stateWithClip(), {
+      type: 'PLAYBACK_SET',
+      playing: true,
+      playheadMs: 500,
+      awaitingStart: true,
+    })
+    const started = editorReducer(pending, { type: 'PLAY_STARTED' })
+    expect(started.playing).toBe(true)
+    expect(started.awaitingPlayStart).toBe(false)
+    expect(started.playheadMs).toBe(500)
+  })
+
+  it('marks a loop from the playhead and enables it', () => {
+    const withIn = editorReducer(
+      editorReducer(stateWithClip(), { type: 'PLAYHEAD_SET', playheadMs: 500 }),
+      { type: 'LOOP_IN_SET' },
+    )
+    expect(withIn.loopRegion).toEqual({ startMs: 500, endMs: 2800 })
+    expect(withIn.loopEnabled).toBe(true)
+
+    const withOut = editorReducer(
+      editorReducer(withIn, { type: 'PLAYHEAD_SET', playheadMs: 900 }),
+      { type: 'LOOP_OUT_SET' },
+    )
+    expect(withOut.loopRegion).toEqual({ startMs: 500, endMs: 900 })
+
+    const disabled = editorReducer(withOut, { type: 'LOOP_ENABLED_SET', enabled: false })
+    expect(disabled.loopEnabled).toBe(false)
+    expect(disabled.loopRegion).toEqual({ startMs: 500, endMs: 900 })
+
+    const cleared = editorReducer(disabled, { type: 'LOOP_CLEAR' })
+    expect(cleared.loopRegion).toBeNull()
+    expect(cleared.loopEnabled).toBe(false)
+  })
+
+  it('shrinking the timeline drops an out-of-range loop and clamps the playhead', () => {
+    let s = editorReducer(stateWithClip(), { type: 'PLAYHEAD_SET', playheadMs: 1200 })
+    s = editorReducer(s, { type: 'LOOP_IN_SET' })
+    s = editorReducer(s, { type: 'PLAYHEAD_SET', playheadMs: 2500 })
+    s = editorReducer(s, { type: 'LOOP_OUT_SET' })
+    expect(s.loopRegion).toEqual({ startMs: 1200, endMs: 2500 })
+
+    const shrunk = editorReducer(s, { type: 'CLIP_DELETED', clipId: 'clip-2' })
+    expect(shrunk.playheadMs).toBe(1000)
+    expect(shrunk.loopRegion).toBeNull()
+    expect(shrunk.loopEnabled).toBe(false)
+  })
+
+  it('restores the parked playhead and loop from PROJECT_LOADED', () => {
+    const base = stateWithClip()
+    const loaded = editorReducer(initialEditorState, {
+      type: 'PROJECT_LOADED',
+      project: { fileName: 'take.mp4', videoUrl: 'blob:x', durationMs: 2800 },
+      clips: base.clips,
+      props: [],
+      silenceConfig: base.silenceConfig,
+      blur: base.blur,
+      playheadMs: 750,
+      loopRegion: { startMs: 100, endMs: 900 },
+      loopEnabled: true,
+    })
+    expect(loaded.playheadMs).toBe(750)
+    expect(loaded.loopRegion).toEqual({ startMs: 100, endMs: 900 })
+    expect(loaded.loopEnabled).toBe(true)
+    expect(loaded.playing).toBe(false)
+    expect(loaded.scrubbing).toBe(false)
+    expect(loaded.awaitingPlayStart).toBe(false)
+  })
+
   it('export phases update status with defaults kept detail', () => {
     const s = editorReducer(stateWithClip(), { type: 'EXPORT_PHASE_SET', phase: 'recording', detail: 'capturing' })
     expect(s.exportStatus).toEqual({ phase: 'recording', detail: 'capturing' })

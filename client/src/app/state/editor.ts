@@ -12,6 +12,7 @@ import { defaultRect, type NormalizedRect } from '../../modules/props/engine'
 import { DEFAULT_EXPORT_SETTINGS, normalizeExportSettings } from '../../modules/export/settings'
 import { isExportBusy, type ExportSettings, type ExportStage } from '../../modules/export/types'
 import type { MediaKind } from '../../modules/media/engine'
+import { MIN_LOOP_REGION_MS, normalizeLoopRegion, type LoopRegion } from '../../modules/playback/engine'
 
 export interface PropItem {
   id: string
@@ -105,6 +106,19 @@ export interface EditorState {
   rotation: Rotation
   playing: boolean
   playheadMs: number
+  /**
+   * Pointer-owned scrub session. While true the transport is paused and the
+   * rAF loop never writes `playheadMs` from the media clock.
+   */
+  scrubbing: boolean
+  /**
+   * Play has been requested, but the preview element must first land on the
+   * parked source instant before it is allowed to start.
+   */
+  awaitingPlayStart: boolean
+  /** In/out review region; endMs is exclusive. */
+  loopRegion: LoopRegion | null
+  loopEnabled: boolean
   /** Default length for newly imported image clips (seconds in the UI). */
   imageDurationMs: number
   exportStatus: ExportStatus
@@ -145,7 +159,14 @@ export type EditorAction =
   | { type: 'PROP_REMOVED'; id: string }
   | { type: 'BLUR_SET'; enabled: boolean }
   | { type: 'BLUR_STRENGTH_SET'; px: number }
-  | { type: 'PLAYBACK_SET'; playing: boolean; playheadMs?: number }
+  | { type: 'PLAYBACK_SET'; playing: boolean; playheadMs?: number; awaitingStart?: boolean }
+  | { type: 'PLAY_STARTED' }
+  | { type: 'SCRUB_BEGIN' }
+  | { type: 'SCRUB_END' }
+  | { type: 'LOOP_IN_SET' }
+  | { type: 'LOOP_OUT_SET' }
+  | { type: 'LOOP_ENABLED_SET'; enabled: boolean }
+  | { type: 'LOOP_CLEAR' }
   | { type: 'PLAYHEAD_SET'; playheadMs: number }
   | { type: 'EXPORT_PHASE_SET'; phase: ExportStatus['phase']; detail?: string }
   | { type: 'EXPORT_STATUS_SET'; status: ExportStatus }
@@ -158,6 +179,10 @@ export type EditorAction =
       props: PropItem[]
       silenceConfig: SilenceConfig
       blur: BlurSettings
+      /** Optional for older callers; snapshots persist these review fields. */
+      playheadMs?: number
+      loopRegion?: LoopRegion | null
+      loopEnabled?: boolean
     }
 
 export const initialEditorState: EditorState = {
@@ -176,6 +201,10 @@ export const initialEditorState: EditorState = {
   rotation: 0,
   playing: false,
   playheadMs: 0,
+  scrubbing: false,
+  awaitingPlayStart: false,
+  loopRegion: null,
+  loopEnabled: false,
   imageDurationMs: 3000,
   exportStatus: {
     phase: null,
@@ -238,9 +267,34 @@ export function clipsOfSource(state: EditorState, videoId: string): Clip[] {
   return state.clips.filter((c) => clipSourceId(state, c) === videoId)
 }
 
-/** Pure transition wrapping: keeps the derived `cutPlan` in sync everywhere. */
+/**
+ * Timeline edits can shrink the track under a parked playhead or a review
+ * loop. Keep both inside the current media and drop a loop whose edges no
+ * longer describe a usable region.
+ */
+function withTimelineSafety(state: EditorState): EditorState {
+  const totalMs = timelineDurationMs(state.clips)
+  const playheadMs = clamp(state.playheadMs, 0, totalMs)
+  const normalizedLoop = normalizeLoopRegion(state.loopRegion, totalMs)
+  // Preserve the existing reference when the region did not actually move;
+  // no-op reducer actions must stay referentially equal.
+  const loopRegion =
+    normalizedLoop &&
+    state.loopRegion &&
+    normalizedLoop.startMs === state.loopRegion.startMs &&
+    normalizedLoop.endMs === state.loopRegion.endMs
+      ? state.loopRegion
+      : normalizedLoop
+  const loopEnabled = state.loopEnabled && loopRegion !== null
+  if (playheadMs === state.playheadMs && loopRegion === state.loopRegion && loopEnabled === state.loopEnabled) {
+    return state
+  }
+  return { ...state, playheadMs, loopRegion, loopEnabled }
+}
+
+/** Pure transition wrapping: keeps the derived `cutPlan` and timeline bounds in sync. */
 export function editorReducer(state: EditorState, action: EditorAction): EditorState {
-  return withActiveCutPlan(baseEditorReducer(state, action))
+  return withActiveCutPlan(withTimelineSafety(baseEditorReducer(state, action)))
 }
 
 function baseEditorReducer(state: EditorState, action: EditorAction): EditorState {
@@ -488,15 +542,71 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
     case 'BLUR_STRENGTH_SET':
       return { ...state, blur: { ...state.blur, px: clamp(action.px, 0, 40) } }
 
-    case 'PLAYBACK_SET':
-      return {
-        ...state,
-        playing: action.playing,
-        playheadMs: action.playheadMs ?? state.playheadMs,
+    case 'PLAYBACK_SET': {
+      const playheadMs = action.playheadMs ?? state.playheadMs
+      // Starting always ends a scrub session; pausing while the pointer is
+      // still down leaves the scrub flag to the pointer's own release.
+      const awaitingPlayStart = action.playing
+        ? action.awaitingStart ?? state.awaitingPlayStart
+        : false
+      const scrubbing = action.playing ? false : state.scrubbing
+      if (
+        state.playing === action.playing &&
+        state.playheadMs === playheadMs &&
+        state.awaitingPlayStart === awaitingPlayStart &&
+        state.scrubbing === scrubbing
+      ) {
+        return state
       }
+      return { ...state, playing: action.playing, playheadMs, awaitingPlayStart, scrubbing }
+    }
 
-    case 'PLAYHEAD_SET':
-      return { ...state, playheadMs: clamp(action.playheadMs, 0, timelineDurationMs(state.clips)) }
+    case 'PLAY_STARTED':
+      return state.awaitingPlayStart ? { ...state, awaitingPlayStart: false } : state
+
+    case 'SCRUB_BEGIN':
+      if (state.scrubbing) return state
+      return { ...state, scrubbing: true, playing: false, awaitingPlayStart: false }
+
+    case 'SCRUB_END':
+      return state.scrubbing ? { ...state, scrubbing: false } : state
+
+    case 'LOOP_IN_SET': {
+      const totalMs = timelineDurationMs(state.clips)
+      if (totalMs <= 0) return state
+      const startMs = clamp(state.playheadMs, 0, totalMs)
+      const proposedEnd = state.loopRegion?.endMs ?? totalMs
+      const endMs = proposedEnd - startMs >= MIN_LOOP_REGION_MS ? proposedEnd : totalMs
+      const region = normalizeLoopRegion({ startMs, endMs }, totalMs)
+      return region === null ? state : { ...state, loopRegion: region, loopEnabled: true }
+    }
+
+    case 'LOOP_OUT_SET': {
+      const totalMs = timelineDurationMs(state.clips)
+      if (totalMs <= 0) return state
+      const endMs = clamp(state.playheadMs, 0, totalMs)
+      const proposedStart = state.loopRegion?.startMs ?? 0
+      const startMs = endMs - proposedStart >= MIN_LOOP_REGION_MS ? proposedStart : 0
+      const region = normalizeLoopRegion({ startMs, endMs }, totalMs)
+      return region === null ? state : { ...state, loopRegion: region, loopEnabled: true }
+    }
+
+    case 'LOOP_ENABLED_SET': {
+      const enabled = action.enabled && state.loopRegion !== null
+      return enabled === state.loopEnabled ? state : { ...state, loopEnabled: enabled }
+    }
+
+    case 'LOOP_CLEAR':
+      return state.loopRegion === null && !state.loopEnabled
+        ? state
+        : { ...state, loopRegion: null, loopEnabled: false }
+
+    case 'PLAYHEAD_SET': {
+      const totalMs = timelineDurationMs(state.clips)
+      const next = Number.isFinite(action.playheadMs) ? clamp(action.playheadMs, 0, totalMs) : 0
+      // Repeated identical seeks are semantically and referentially no-ops.
+      return next === state.playheadMs ? state : { ...state, playheadMs: next }
+    }
 
     case 'EXPORT_PHASE_SET':
       return { ...state, exportStatus: { phase: action.phase, detail: action.detail ?? state.exportStatus.detail } }
@@ -519,7 +629,11 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
       return { ...state, exportDialogOpen: action.open }
     }
 
-    case 'PROJECT_LOADED':
+    case 'PROJECT_LOADED': {
+      const totalMs = timelineDurationMs(action.clips)
+      const loopRegion = normalizeLoopRegion(action.loopRegion ?? null, totalMs)
+      const requestedPlayhead = action.playheadMs ?? 0
+      const playheadMs = Number.isFinite(requestedPlayhead) ? clamp(requestedPlayhead, 0, totalMs) : 0
       return {
         ...state,
         project: {
@@ -534,8 +648,13 @@ function baseEditorReducer(state: EditorState, action: EditorAction): EditorStat
         silenceConfig: action.silenceConfig,
         blur: action.blur,
         playing: false,
-        playheadMs: 0,
+        scrubbing: false,
+        awaitingPlayStart: false,
+        playheadMs,
+        loopRegion,
+        loopEnabled: (action.loopEnabled ?? false) && loopRegion !== null,
       }
+    }
 
     default:
       return state

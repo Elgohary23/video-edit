@@ -13,7 +13,7 @@ import { computePeaks } from '../audio-analysis/engine'
 import { mediaKindOf } from '../media/engine'
 import { isMediaDrag, readMediaDragId } from '../media/drag'
 import { timelineDurationMs, timelineStartOfClip } from '../timeline/engine'
-import { clamp } from '../shared/utils'
+import { clamp, formatTimecode } from '../shared/utils'
 import { ClipDeleteButton } from './ClipDeleteButton'
 
 const WAVE_HEIGHT = 72
@@ -36,7 +36,7 @@ interface LaneDrag {
  * shared playhead. Pointer interactions map directly to reducer actions.
  */
 export function TimelinePanel() {
-  const { state, seek, splitClipAt, trimClipBy, setPropRange, selectProp, selectVideo, addTimelineClip, importMedia } =
+  const { state, seek, splitClipAt, trimClipBy, setPropRange, selectProp, selectVideo, addTimelineClip, importMedia, clearLoop } =
     useEditor()
 
   const waveRef = useRef<HTMLCanvasElement>(null)
@@ -235,7 +235,7 @@ export function TimelinePanel() {
   return (
     <section className="shrink-0 border-t border-line p-3">
       <div className="mx-auto w-full max-w-5xl space-y-2">
-        <div className="flex items-center justify-between text-[11px] text-zinc-400">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-400">
           <div className="flex items-center gap-2">
             <span className="font-semibold uppercase tracking-[0.14em] text-zinc-300">Timeline</span>
             {state.cutPlan !== null ? (
@@ -250,6 +250,20 @@ export function TimelinePanel() {
             ) : null}
           </div>
           <div className="flex items-center gap-3 text-[10px]">
+            {state.loopRegion && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-accent/30 bg-accent/10 py-0.5 pl-2 pr-0.5 text-[10px] tabular-nums text-accent/90">
+                Loop {formatTimecode(state.loopRegion.startMs)}–{formatTimecode(state.loopRegion.endMs)}
+                <button
+                  type="button"
+                  onClick={clearLoop}
+                  aria-label="Clear loop region"
+                  title="Clear loop in/out (Shift+P)"
+                  className="grid size-4 place-items-center rounded-full text-accent/70 transition-colors hover:bg-accent/20 hover:text-accent"
+                >
+                  ×
+                </button>
+              </span>
+            )}
             <span className="tabular-nums text-zinc-400">
               {state.clips.length} clip{state.clips.length === 1 ? '' : 's'} · {state.props.length} prop
               {state.props.length === 1 ? '' : 's'}
@@ -449,6 +463,23 @@ export function TimelinePanel() {
                 </div>
               ))}
             </div>
+
+            {/* loop review region spanning waveform + lanes */}
+            {state.loopRegion && !empty && (
+              <div
+                aria-hidden
+                data-loop-region
+                className={`pointer-events-none absolute inset-y-0 border-x ${
+                  state.loopEnabled
+                    ? 'border-accent/70 bg-accent/10'
+                    : 'border-zinc-500/50 bg-zinc-400/5'
+                }`}
+                style={{
+                  left: `${pct(state.loopRegion.startMs)}%`,
+                  width: `max(2px, ${pct(state.loopRegion.endMs - state.loopRegion.startMs)}%)`,
+                }}
+              />
+            )}
 
             {/* playhead spanning waveform + lanes */}
             {!empty && (
