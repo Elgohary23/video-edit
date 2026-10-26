@@ -176,6 +176,37 @@ describe('planTransport — the playhead is the single source of truth', () => {
     expect(plan).toEqual({ action: 'advance', playheadMs: 1000 })
   })
 
+  it('lets an in-flight cut seek land instead of restarting it on every frame', () => {
+    // Silence cuts jump to a later source instant. During that seek the
+    // element reports readyState 1; re-issuing currentTime would restart the
+    // seek forever and park playback on the first clip.
+    const clips = [clip('a', 0, 2000, 'v1'), clip('b', 3000, 5000, 'v1')]
+    expect(
+      planTransport(
+        transport({
+          clips,
+          playheadMs: 2000,
+          playing: true,
+          videoTimeMs: 3000,
+          videoReady: false,
+          videoSeeking: true,
+        }),
+      ),
+    ).toEqual({ action: 'hold' })
+
+    // Once the seek lands, the next clip starts from its exact first frame.
+    expect(
+      planTransport(
+        transport({
+          clips,
+          playheadMs: 2000,
+          playing: true,
+          videoTimeMs: 3000,
+        }),
+      ),
+    ).toEqual({ action: 'play-video', playheadMs: 2000 })
+  })
+
   it('finishes at the timeline end when the last clip reaches its out point', () => {
     const plan = planTransport(
       transport({ clips: [clip('a', 0, 1000, 'v1')], playheadMs: 950, playing: true, videoTimeMs: 1000 }),
@@ -185,10 +216,26 @@ describe('planTransport — the playhead is the single source of truth', () => {
 
   it('holds the last good frame while the element is seeking', () => {
     expect(
-      planTransport(transport({ playheadMs: 2000, playing: true, videoTimeMs: 1990, videoSeeking: true })),
+      planTransport(
+        transport({
+          playheadMs: 2000,
+          playing: true,
+          videoTimeMs: 1990,
+          videoReady: false,
+          videoSeeking: true,
+        }),
+      ),
     ).toEqual({ action: 'hold' })
     expect(
-      planTransport(transport({ playheadMs: 2000, playing: false, videoTimeMs: 1000, videoSeeking: true })),
+      planTransport(
+        transport({
+          playheadMs: 2000,
+          playing: false,
+          videoTimeMs: 1000,
+          videoReady: false,
+          videoSeeking: true,
+        }),
+      ),
     ).toEqual({ action: 'hold' })
   })
 
@@ -299,6 +346,7 @@ describe('scrub sessions own the playhead', () => {
         playheadMs: 5000,
         playing: true,
         videoTimeMs: 0,
+        videoReady: false,
         videoSeeking: true,
         scrubbing: true,
       }),
@@ -342,6 +390,7 @@ describe('play-from-parked-position gate', () => {
         playing: true,
         awaitingStart: true,
         videoTimeMs: 0,
+        videoReady: false,
         videoSeeking: true,
       }),
     )

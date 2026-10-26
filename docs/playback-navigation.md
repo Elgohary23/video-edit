@@ -29,6 +29,15 @@ The transport had no scrub flag, frame-step math, keyboard map, reverse review,
 or loop region. The range input was the only navigation surface, and its 10 ms
 step could not express export-frame steps or a repeatable in/out loop.
 
+### 4. Cut transitions restarted their own seek
+
+At a cut, the transport issues one seek from the previous clip's out-point to
+the next clip's source in-point. A seek immediately drops `readyState` to
+`HAVE_METADATA` (1). The planner used to test `videoReady` before
+`videoSeeking`, so every animation frame issued the same `currentTime`
+assignment again. Each assignment restarted the seek that was already running;
+it could never land, and playback stayed paused at the cut with `seeking: true`.
+
 ## Fix model
 
 ### Scrub session owns the thumb
@@ -61,6 +70,14 @@ tolerance, so a stale clock cannot win at startup.
 
 Loop wraps use the same gate at the in-point. The compositor holds the last
 good frame while the seek is in flight, so wrapping has no black frame.
+
+### Media seeks are allowed to land
+
+`planTransport()` now resolves the source URL first, then holds whenever
+`video.seeking` is true, and only then checks `readyState`. A seek is never
+re-issued while one is already in flight, so `readyState` can recover and the
+next clip starts normally. This applies to playback cuts, the play gate, paused
+seeks, and scrub seeks alike.
 
 ### Review keys
 
@@ -121,15 +138,18 @@ snapshots load at the start with looping off.
 8. **Save/load.** Save a project with a loop and a parked playhead, reload it,
    and confirm the playhead, loop band, and loop-enabled state are restored.
    Playback starts paused.
-9. **Existing suites.** `npm run test -w client`, `npm run typecheck`, and
-   `npm run lint` stay green.
+9. **Silence-cut playback.** Cut silence so the timeline has three or more clips
+   with source gaps, park at the start, and press Play. Playback crosses every
+   cut without stopping; the hidden `<video>` seeks once per cut and resumes.
+10. **Existing suites.** `npm run test -w client`, `npm run typecheck`, and
+    `npm run lint` stay green.
 
 ## Automated coverage
 
 - `client/src/modules/playback/engine.test.ts` — scrub clock isolation,
   play-from-park seek gate, tight startup guard, loop wrap (video/image, clip
-  end), frame-grid stepping, loop normalization, play-start resolution, and
-  repeated identical plan results.
+  end), in-flight cut-seek handoff, frame-grid stepping, loop normalization,
+  play-start resolution, and repeated identical plan results.
 - `client/src/modules/playback/shortcuts.test.ts` — key mapping, editable-field
   protection, repeat behavior, and default-prevention rules.
 - `client/src/modules/playback/ScrubberBar.test.tsx` — local thumb ownership

@@ -191,10 +191,15 @@ export function planTransport(input: TransportInput): TransportPlan {
     if (!scrubbed || input.kind !== 'video' || input.sourceUrl === null) {
       return { action: 'pause-video' }
     }
-    if (input.videoUrl !== input.sourceUrl || !input.videoReady) {
+    if (input.videoUrl !== input.sourceUrl) {
       return { action: 'seek-video', url: input.sourceUrl, srcMs: scrubbed.srcMs }
     }
+    // A seek drops readyState to HAVE_METADATA. Re-issuing the seek while it
+    // is in flight restarts it every frame and it can never land.
     if (input.videoSeeking) return { action: 'hold' }
+    if (!input.videoReady) {
+      return { action: 'seek-video', url: input.sourceUrl, srcMs: scrubbed.srcMs }
+    }
     if (Math.abs(input.videoTimeMs - scrubbed.srcMs) > PAUSED_SEEK_TOLERANCE_MS) {
       return { action: 'seek-video', url: input.sourceUrl, srcMs: scrubbed.srcMs }
     }
@@ -235,16 +240,23 @@ export function planTransport(input: TransportInput): TransportPlan {
     return input.playing ? { action: 'finish', playheadMs: totalMs } : { action: 'pause-video' }
   }
 
-  // A clip from another import, or an element that has not decoded yet: seek
-  // to the mapped source instant before any playhead update.
-  if (input.videoUrl !== input.sourceUrl || !input.videoReady) {
+  // A clip from another import needs its source loaded before any playhead
+  // update. A seek that is already running must be allowed to land first:
+  // readyState temporarily drops to HAVE_METADATA, and re-issuing currentTime
+  // here restarts the seek on every frame. That is what froze playback at a
+  // cut boundary before the next clip could start.
+  if (input.videoUrl !== input.sourceUrl) {
+    return { action: 'seek-video', url: input.sourceUrl, srcMs: place.srcMs }
+  }
+  if (input.videoSeeking) return { action: 'hold' }
+  if (!input.videoReady) {
     return { action: 'seek-video', url: input.sourceUrl, srcMs: place.srcMs }
   }
 
   // Play gate: never start the media clock until the element is parked on the
-  // exact requested frame. `video.seeking` covers the seeked-event wait.
+  // exact requested frame. The early seek guard above covers the seeked-event
+  // wait; here the element is ready and stationary.
   if (input.awaitingStart) {
-    if (input.videoSeeking) return { action: 'hold' }
     if (Math.abs(input.videoTimeMs - place.srcMs) > PLAY_START_LAND_TOLERANCE_MS) {
       return { action: 'seek-video', url: input.sourceUrl, srcMs: place.srcMs }
     }
@@ -252,14 +264,11 @@ export function planTransport(input: TransportInput): TransportPlan {
   }
 
   if (!input.playing) {
-    if (input.videoSeeking) return { action: 'hold' }
     if (Math.abs(input.videoTimeMs - place.srcMs) > PAUSED_SEEK_TOLERANCE_MS) {
       return { action: 'seek-video', url: input.sourceUrl, srcMs: place.srcMs }
     }
     return { action: 'pause-video' }
   }
-
-  if (input.videoSeeking) return { action: 'hold' }
 
   // The element reached the end of this clip before the playhead caught up.
   if (input.videoTimeMs >= place.clip.srcEndMs) {
